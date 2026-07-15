@@ -35,13 +35,21 @@ RUN mkdir -p libs \
     && tar xf boost-1.87.0-b2-nodocs.tar.xz -C libs && mv libs/boost-1.87.0 libs/boost \
     && rm boost-1.87.0-b2-nodocs.tar.xz \
     && sed -i -E 's/-fwasm-exceptions/-fexceptions/g' libs/boost/tools/build/src/tools/emscripten.jam
-RUN make libs \
-    && rm -rf libs/fontconfig \
-    && git clone --filter=blob:none --no-checkout https://gitlab.freedesktop.org/fontconfig/fontconfig.git libs/fontconfig \
+# Pin fontconfig to an immutable release commit BEFORE `make libs`. The
+# upstream openscad-wasm Makefile's `libs/fontconfig` target otherwise clones
+# fontconfig from the moving `main` branch and applies patches/fontconfig.patch,
+# which breaks whenever upstream's Makefile.am drifts (the patch stops
+# applying). By pre-creating libs/fontconfig here, `make` treats that
+# prerequisite-less directory target as already satisfied and skips its
+# clone+patch step; the pinned source is then built by the `fontconfig` stage
+# below. This is what the previous `rm -rf libs/fontconfig && git clone …`
+# achieved, but doing it first avoids depending on the drifting upstream patch.
+RUN git clone --filter=blob:none --no-checkout https://gitlab.freedesktop.org/fontconfig/fontconfig.git libs/fontconfig \
     && git -C libs/fontconfig checkout ${FONTCONFIG_COMMIT} \
     && awk '/^SUBDIRS=fontconfig fc-case fc-lang src/ { print "SUBDIRS=fontconfig fc-case fc-lang src"; skip=1; next } skip && /^[[:space:]]*its po po-conf test$/ { skip=0; next } skip { next } { print }' libs/fontconfig/Makefile.am > libs/fontconfig/Makefile.am.new \
     && mv libs/fontconfig/Makefile.am.new libs/fontconfig/Makefile.am \
-    && sed -i 's/  RUN_FC_CACHE_TEST=test -z "$(DESTDIR)"/  RUN_FC_CACHE_TEST=false/' libs/fontconfig/Makefile.am
+    && sed -i 's/  RUN_FC_CACHE_TEST=test -z "$(DESTDIR)"/  RUN_FC_CACHE_TEST=false/' libs/fontconfig/Makefile.am \
+    && make libs
 
 FROM ${EMSCRIPTEN_SDK_TAG} AS builder
 ARG CMAKE_BUILD_TYPE=Release
