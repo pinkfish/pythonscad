@@ -149,14 +149,30 @@ class NumpyBackedTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             hash(ov.Vector3([1, 2, 3]))
 
-    def test_matrix_repr_is_list_form(self):
-        m = ov.Matrix4x4([[1.0, 0.0, 0.0, 5.0], [0.0, 1.0, 0.0, 0.0],
-                          [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+    def test_c_vector3_factory(self):
+        r = ov._c_vector3([1, 2, 3])
+        self.assertIsInstance(r, self.np.ndarray)
+        self.assertEqual(repr(r), "vector(1,2,3)")  # legacy vector(...) form
+        self.assertEqual(list(r), [1.0, 2.0, 3.0])
+        self.assertAlmostEqual(r.norm(), (1 + 4 + 9) ** 0.5)
+        self.assertAlmostEqual(r.dot([1, 0, 0]), 1.0)
+
+    def test_c_array_factory_float_and_int(self):
+        # A float matrix (as the C side builds it, from PyFloat) -> float repr.
+        m = ov._c_array([[1.0, 0.0, 0.0, 5.0], [0.0, 1.0, 0.0, 0.0],
+                         [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+        self.assertIsInstance(m, self.np.ndarray)
         self.assertEqual(
             repr(m),
             "[[1.0, 0.0, 0.0, 5.0], [0.0, 1.0, 0.0, 0.0], "
             "[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]",
         )
+        # Integer index lists keep integer repr.
+        self.assertEqual(repr(ov._c_array([[0, 1, 2, 3]])), "[[0, 1, 2, 3]]")
+
+    def test_c_array_ragged_returns_none(self):
+        # Ragged input (mixed-length faces) -> None so the C side keeps a list.
+        self.assertIsNone(ov._c_array([[0, 1, 2, 3], [0, 1, 4]]))
 
 
 # Child-process program that forces the NumPy-absent (list-backed) path by
@@ -207,6 +223,9 @@ _NO_NUMPY_PROGRAM = textwrap.dedent(
         def tolist(self):
             return [1, 2, 3]
     assert ov.Vector3.from_array(_Fake()) == [1.0, 2.0, 3.0]
+    # The C-side factories signal "no numpy backing" by returning None.
+    assert ov._c_vector3([1, 2, 3]) is None
+    assert ov._c_array([[1, 2], [3, 4]]) is None
     print("NO_NUMPY_OK")
     """
 )

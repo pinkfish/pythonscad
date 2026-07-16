@@ -1573,6 +1573,17 @@ if(ENABLE_PYTHON)
   set_property(TEST python-numpy-api PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
   set_property(TEST python-numpy-api PROPERTY SKIP_REGULAR_EXPRESSION "^SKIP")
 
+  # Validates the NumPy-*absent* path end-to-end: blocks `import numpy` inside
+  # the interpreter, then checks import, list-backed classes, list/tuple
+  # inputs, native/list return fallback, and converter error paths. Blocks
+  # numpy itself so it runs deterministically whether or not numpy is present.
+  add_test(NAME python-no-numpy CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_python_no_numpy.py
+      ${OPENSCAD_BINPATH}
+  )
+  set_property(TEST python-no-numpy PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+
   # Unit tests for the pure-Python Vector/Matrix helper classes
   # (libraries/python/openscad/_vectors.py). Needs no pythonscad binary and
   # exercises both the NumPy-backed and list-backed paths.

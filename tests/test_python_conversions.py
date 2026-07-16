@@ -21,8 +21,8 @@ Helper -> entry point coverage:
     python_intlistval       - debug(faces)
     python_to2dvarpointlist - polygon(points 2-D/3-D)
     python_to2dintlist      - polygon(points, paths)
-    python_fromvector       - .size / .bbox.* / cross()
-    python_frommatrix       - face.matrix
+    python_fromvector       - .size / .bbox.* / cross()   (numpy-backed return)
+    python_frommatrix       - face.matrix                  (numpy-backed return)
     python_from2dvarpointlist / python_from2dint
                             - polygon.points / polyhedron.faces (list returns)
 
@@ -180,15 +180,19 @@ same("to2dintlist-paths",
      _ext(polygon(_sq, paths=[[0, 1, 2, 3]])),
      _ext(polygon(_sq, paths=np.array([[0, 1, 2, 3]]))))
 
-# --- python_fromvector (vector return) -------------------------------
+# --- python_fromvector (numpy-backed vector return) ------------------
 _sz = cube([2, 4, 6]).size
+check("fromvector-ndarray", isinstance(_sz, np.ndarray))
 check("fromvector-value", list(_sz) == [2.0, 4.0, 6.0])
-check("fromvector-repr", repr(_sz) == "vector(2,4,6)")
+check("fromvector-repr", repr(_sz).startswith("vector("))
+check("fromvector-dot", abs(_sz.dot([1, 0, 0]) - 2.0) < 1e-9)
+check("fromvector-norm", abs(_sz.norm() - (4 + 16 + 36) ** 0.5) < 1e-9)
 check("fromvector-cross", list(vector(1, 0, 0) * vector(0, 1, 0)) == [0.0, 0.0, 1.0])
 
-# --- python_frommatrix (4x4 return) ----------------------------------
+# --- python_frommatrix (numpy-backed 4x4 return) ---------------------
 _m = cube(2).rotz(30).faces()[0].matrix
-check("frommatrix-shape", len(_m) == 4 and len(_m[0]) == 4)
+check("frommatrix-ndarray", isinstance(_m, np.ndarray))
+check("frommatrix-shape", _m.shape == (4, 4))
 # round-trips straight back through python_tomatrix without error
 multmatrix(cube(1), _m)
 check("frommatrix-roundtrip", True)

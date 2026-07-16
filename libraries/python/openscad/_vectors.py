@@ -1,16 +1,18 @@
 """Vector and matrix helper types for the PythonSCAD API.
 
 These classes give scripts a convenient, well-typed way to build the
-coordinate/matrix arguments that the PythonSCAD API accepts, while
+coordinate/matrix arguments that the PythonSCAD C API accepts, while
 transparently bridging between plain Python lists and NumPy arrays:
 
 * When NumPy is installed the classes are **NumPy-backed** -- every
   instance is a genuine :class:`numpy.ndarray` subclass, so array maths
-  (``v1 + v2``, ``m @ v``) works.
+  (``v1 + v2``, ``m @ v``) works and the values returned from the C API
+  (which are NumPy arrays when NumPy is present) interoperate seamlessly.
 * When NumPy is **not** installed the classes fall back to :class:`list`
   subclasses. They still accept lists (or anything list-like) and are
-  themselves plain lists, so the same script keeps working without NumPy --
-  values are seamlessly converted to/from lists.
+  themselves plain lists, which the C API accepts directly, so the same
+  script keeps working without NumPy -- values are seamlessly converted
+  to/from lists.
 
 In both cases every constructor accepts a Python list, tuple, another
 vector/matrix or (when available) a NumPy array, and validates the
@@ -21,7 +23,8 @@ the pip wheel (which packages the ``openscad``/``pythonscad`` packages, not
 the top-level helper modules). It imports only :mod:`numpy` (optionally), so
 it can be loaded directly by file path for unit testing without importing
 the ``openscad`` package (and hence without the compiled ``_openscad``
-extension).
+extension). The C API reaches the ``_c_*`` factories via
+``PyImport_ImportModule("openscad._vectors")``.
 
 Public names: :data:`Vector1`, :data:`Vector2`, :data:`Vector3`,
 :class:`Matrix4x4` and the :data:`HAS_NUMPY` flag.
@@ -55,18 +58,17 @@ def _as_plain_list(value):
 if HAS_NUMPY:
 
     class _ScadArray(_np.ndarray):
-        """Base ndarray subclass for the NumPy-backed vector/matrix types.
+        """Base ndarray subclass for all NumPy-backed values.
 
-        Presents like the plain-list types so scripts (and printed output)
-        behave the same whether or not NumPy is installed:
+        Provides backward-compatible presentation so existing scripts and
+        golden tests are unaffected by the switch to NumPy-backed values:
 
-        * ``repr`` / ``str`` render as a plain Python list of lists.
+        * ``repr`` / ``str`` render as a plain Python list of lists, matching
+          the legacy list output.
         * ``__iter__`` yields plain Python scalars/lists (via ``tolist()``)
           rather than ``numpy`` scalars, so ``list(v)`` and ``for x in v``
-          produce ``[10.0, 20.0, 30.0]`` and ``10.0`` -- not ``np.float64(...)``.
-        * ``__eq__`` returns a plain ``bool`` (list comparison) rather than
-          NumPy's element-wise boolean array, so ``if v == [1, 2, 3]:`` works
-          instead of raising "truth value of an array is ambiguous".
+          produce ``[10.0, 20.0, 30.0]`` and ``10.0`` -- not
+          ``np.float64(...)`` -- exactly like the legacy types.
         """
 
         def __repr__(self):
@@ -79,6 +81,10 @@ if HAS_NUMPY:
             return iter(self.tolist())
 
         def __eq__(self, other):
+            # Return a plain bool (list comparison) rather than NumPy's
+            # element-wise boolean array, so idioms like ``if v == [1, 2, 3]``
+            # behave like the legacy list/vector types instead of raising
+            # "truth value of an array is ambiguous".
             try:
                 return self.tolist() == _as_plain_list(other)
             except Exception:
@@ -149,7 +155,52 @@ if HAS_NUMPY:
             """Build the matrix from a NumPy array (or any list-of-lists)."""
             return cls(array)
 
+    class _ScadVector3(_ScadArray):
+        """3D vector return value: NumPy-backed, prints as ``vector(x,y,z)``.
+
+        The ``%g`` formatting matches OpenSCAD's C++ ``ostream`` default so
+        the printed form is identical to the legacy native vector type.
+        """
+
+        def __repr__(self):
+            return "vector(%g,%g,%g)" % (float(self[0]), float(self[1]), float(self[2]))
+
+        __str__ = __repr__
+
+        def dot(self, other):
+            return float(_np.dot(_np.asarray(self), _np.asarray(other)))
+
+        def norm(self):
+            return float(_np.sqrt(_np.dot(_np.asarray(self), _np.asarray(self))))
+
+    def _c_vector3(seq):
+        """Factory used by the C API to wrap a 3-vector (or ``None`` if it can't)."""
+        try:
+            return _np.asarray(seq, dtype=float).view(_ScadVector3)
+        except Exception:
+            return None
+
+    def _c_array(seq):
+        """Factory used by the C API to wrap a matrix / point list / index list.
+
+        Returns ``None`` for ragged input (e.g. mixed-length faces) so the C
+        side keeps the plain list-of-lists it already built.
+        """
+        try:
+            return _np.asarray(seq).view(_ScadArray)
+        except Exception:
+            return None
+
 else:
+
+    def _c_vector3(seq):
+        # No NumPy: the C side falls back to its native vector type.
+        return None
+
+    def _c_array(seq):
+        # No NumPy: the C side keeps its plain list output.
+        return None
+
 
     class _ListVector(list):
         """Fixed-length vector backed by :class:`list` (NumPy absent)."""

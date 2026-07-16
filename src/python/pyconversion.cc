@@ -120,6 +120,53 @@ bool python_is_sequence(PyObject *o)
   return PyList_Check(o) || PyTuple_Check(o) || PySequence_Check(o);
 }
 
+/*
+ * Wraps the already-built Python list/list-of-lists `seq` in a NumPy-backed
+ * return value by calling a factory in the pure-Python `openscad._vectors`
+ * module (`_c_vector3` for 3-vectors, `_c_array` for matrices / point lists
+ * / index lists). numpy and openscad._vectors are imported lazily at runtime,
+ * so there is no build-time dependency on either.
+ *
+ * Returns a new reference to the NumPy-backed value, or nullptr (error state
+ * cleared) when numpy is not installed, openscad._vectors is unavailable, or
+ * the conversion is not possible (e.g. a ragged nested sequence -- the factory
+ * returns None). Callers fall back to native list/vector output on nullptr,
+ * which realises the "numpy-backed when available, plain list/vector
+ * otherwise" contract. Because the factories return values whose repr/str
+ * match the legacy output, existing scripts and golden tests are unaffected.
+ */
+static PyObject *python_scad_array(PyObject *seq, const char *factory)
+{
+  if (seq == nullptr) return nullptr;
+  PyObject *mod = PyImport_ImportModule("openscad._vectors");
+  if (mod == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  PyObject *fn = PyObject_GetAttrString(mod, factory);
+  Py_DECREF(mod);
+  if (fn == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  PyObject *result = PyObject_CallFunctionObjArgs(fn, seq, nullptr);
+  Py_DECREF(fn);
+  if (result == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  if (result == Py_None) {  // numpy absent or ragged input
+    Py_DECREF(result);
+    return nullptr;
+  }
+  return result;
+}
+
+static PyObject *python_numpy_matrix(PyObject *seq)
+{
+  return python_scad_array(seq, "_c_array");
+}
+
 std::vector<int> python_intlistval(PyObject *list)
 {
   std::vector<int> result;
@@ -202,6 +249,11 @@ PyObject *python_frommatrix(const Matrix4d& mat)
     for (int j = 0; j < 4; j++) PyList_SetItem(row, j, PyFloat_FromDouble(mat(i, j)));
     PyList_SetItem(pyo, i, row);
   }
+  PyObject *arr = python_numpy_matrix(pyo);
+  if (arr != nullptr) {
+    Py_DECREF(pyo);
+    return arr;
+  }
   return pyo;
 }
 
@@ -277,6 +329,16 @@ int python_tovector(PyObject *pyt, Vector3d& vec)
 
 PyObject *python_fromvector(const Vector3d vec)
 {
+  PyObject *list = PyList_New(3);
+  for (int i = 0; i < 3; i++) PyList_SetItem(list, i, PyFloat_FromDouble(vec[i]));
+  PyObject *arr = python_scad_array(list, "_c_vector3");
+  if (arr != nullptr) {
+    Py_DECREF(list);
+    return arr;
+  }
+  Py_DECREF(list);
+  // numpy unavailable: return the native vector type, which supports the
+  // element-wise +, -, *, dot, cross and norm operations.
   PyOpenSCADVectorObject *pyvec =
     (PyOpenSCADVectorObject *)PyOpenSCADVectorType.tp_alloc(&PyOpenSCADVectorType, 0);
   if (pyvec)
@@ -375,6 +437,13 @@ std::vector<std::vector<size_t>> python_to2dintlist(PyObject *pypaths)
   return result;
 }
 
+// Point / index collections are returned as plain Python lists of
+// coordinates (not a single NumPy 2-D array), even when NumPy is installed.
+// A collection of points is indexed and grown element-wise by scripts
+// (e.g. `pts[i] + [0]` to promote a 2-D point to 3-D), and those list
+// semantics differ from NumPy's element-wise broadcasting -- returning a
+// NumPy matrix here would silently break that idiom. The individual
+// coordinate vectors and 4x4 matrices returned elsewhere *are* NumPy-backed.
 PyObject *python_from2dvarpointlist(const std::vector<Vector3d>& ptlist)
 {
   int n = ptlist.size();
@@ -418,6 +487,7 @@ PyObject *python_from2dint(const std::vector<std::vector<size_t>>& intlist)
     }
     PyList_SetItem(result, i, subresult);
   }
+  // Index collections stay plain lists of lists (see python_from2dvarpointlist).
   return result;
 }
 
@@ -433,6 +503,7 @@ PyObject *python_from2dlong(const std::vector<IndexedFace>& intlist)
     }
     PyList_SetItem(result, i, subresult);
   }
+  // Index collections stay plain lists of lists (see python_from2dvarpointlist).
   return result;
 }
 
