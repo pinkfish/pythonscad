@@ -22,14 +22,6 @@ Because it blocks NumPy itself, this test is deterministic on any machine
 """
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import tempfile
-
-
-TIMEOUT_SECONDS = 120
-
 # Runs inside the pythonscad interpreter with numpy import blocked up front.
 PYTHONSCAD_PROGRAM = r'''
 import atexit as _atexit, builtins as _b, sys as _sys, os as _os, tempfile as _tempfile
@@ -148,54 +140,9 @@ _show(cube(1))
 '''
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: test_python_no_numpy.py <pythonscad-binary>", file=sys.stderr)
-        return 2
-
-    pythonscad = sys.argv[1]
-    if not os.path.isfile(pythonscad):
-        print(f"binary not found: {pythonscad}", file=sys.stderr)
-        return 2
-
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".py", delete=False, encoding="utf-8"
-    ) as fh:
-        fh.write(PYTHONSCAD_PROGRAM)
-        script_path = fh.name
-    out_stl = script_path + ".out.stl"
-
-    try:
-        proc = subprocess.run(
-            [pythonscad, "--trust-python", script_path, "-o", out_stl],
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SECONDS,
-        )
-    finally:
-        os.remove(script_path)
-        if os.path.exists(out_stl):
-            os.remove(out_stl)
-
-    print("===== stdout =====")
-    print(proc.stdout)
-    print("===== stderr =====", file=sys.stderr)
-    print(proc.stderr, file=sys.stderr)
-
-    # pythonscad routes Python print() output to stderr, so search both.
-    combined = (proc.stdout or "") + (proc.stderr or "")
-
-    if proc.returncode != 0:
-        print(f"FAIL: pythonscad exited with {proc.returncode}", file=sys.stderr)
-        return 1
-
-    if "NO_NUMPY_OK" not in combined:
-        print("FAIL: no-numpy validation script did not complete", file=sys.stderr)
-        return 1
-
-    print("PASS")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+def test_api_without_numpy(run_pythonscad):
+    """The API must work with NumPy unavailable (list-backed fallback)."""
+    output = run_pythonscad(PYTHONSCAD_PROGRAM)
+    assert "NO_NUMPY_OK" in output, (
+        "the in-interpreter script did not run to completion:\n" + output
+    )

@@ -14,14 +14,6 @@ into a skipped result via SKIP_REGULAR_EXPRESSION.
 """
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import tempfile
-
-
-TIMEOUT_SECONDS = 120
-
 # This program runs *inside* the pythonscad interpreter.
 PYTHONSCAD_PROGRAM = r'''
 import atexit as _atexit
@@ -134,63 +126,9 @@ _show(_cube(1))
 '''
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: test_python_numpy_api.py <pythonscad-binary>", file=sys.stderr)
-        return 2
-
-    pythonscad = sys.argv[1]
-    if not os.path.isfile(pythonscad):
-        print(f"binary not found: {pythonscad}", file=sys.stderr)
-        return 2
-
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".py", delete=False, encoding="utf-8"
-    ) as fh:
-        fh.write(PYTHONSCAD_PROGRAM)
-        script_path = fh.name
-
-    # Pass an output file so the binary runs headless and exits instead of
-    # launching the GUI. The script does its own exports; this top-level
-    # output is unused (the script shows nothing) but forces batch mode.
-    out_stl = script_path + ".out.stl"
-
-    try:
-        proc = subprocess.run(
-            [pythonscad, "--trust-python", script_path, "-o", out_stl],
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SECONDS,
-        )
-    finally:
-        os.remove(script_path)
-        if os.path.exists(out_stl):
-            os.remove(out_stl)
-
-    print("===== stdout =====")
-    print(proc.stdout)
-    print("===== stderr =====", file=sys.stderr)
-    print(proc.stderr, file=sys.stderr)
-
-    # pythonscad routes Python print() output to stderr, so search both.
-    combined = (proc.stdout or "") + (proc.stderr or "")
-
-    if "SKIP" in combined:
-        # Surface the SKIP marker on stdout for SKIP_REGULAR_EXPRESSION.
-        print("SKIP: numpy not available")
-        return 0
-
-    if proc.returncode != 0:
-        print(f"FAIL: pythonscad exited with {proc.returncode}", file=sys.stderr)
-        return 1
-
-    if "NUMPY_API_OK" not in combined:
-        print("FAIL: numpy API script did not complete", file=sys.stderr)
-        return 1
-
-    print("PASS")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+def test_numpy_inputs_match_lists(run_pythonscad):
+    """NumPy array inputs must produce byte-identical geometry to list inputs."""
+    output = run_pythonscad(PYTHONSCAD_PROGRAM)
+    assert "NUMPY_API_OK" in output, (
+        "the in-interpreter script did not run to completion:\n" + output
+    )
