@@ -24,6 +24,7 @@ from openscad import (  # noqa: F401
     ChildRef,
     Openscad,   # legacy alias
     PyOpenSCAD,
+    TextMetrics,
 )
 
 # Convention: any module-level import that is NOT meant to be part of
