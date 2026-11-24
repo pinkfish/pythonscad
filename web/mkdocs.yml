@@ -1,5 +1,8 @@
 site_name: PythonSCAD
 site_url: https://www.pythonscad.org/
+
+extra:
+  test_site: false
 repo_url: https://github.com/pythonscad/pythonscad/
 repo_name: pythonscad/pythonscad
 theme:
@@ -35,7 +38,7 @@ theme:
         name: Switch to dark mode
 
 extra_css:
-  - stylesheets/extra.css
+  - stylesheets/extra.css?v=6
 
 extra_javascript:
   - javascript/downloads-common.js
@@ -48,17 +51,28 @@ nav:
   - Downloads: downloads.md
   - Release Notes:
       - Overview: releases/index.md
+      - PythonSCAD v1.2.0: releases/PythonSCAD v1.2.0.md
       - PythonSCAD v1.1.2: releases/PythonSCAD v1.1.2.md
       - PythonSCAD v1.0.0: releases/PythonSCAD v1.0.0.md
       - PythonSCAD v0.20.0: releases/PythonSCAD v0.20.0.md
       - PythonSCAD v0.18.0: releases/PythonSCAD v0.18.0.md
       - PythonSCAD v0.17.0: releases/PythonSCAD v0.17.0.md
       - PythonSCAD v0.16.0: releases/PythonSCAD v0.16.0.md
-  - Playground: https://www.pythonscad.org/playground/
+  - Playground: /playground/
   - Installation: installation.md
+  - Slicer integration: slicer-integration.md
+  - Libraries:
+      - Overview: libraries/index.md
+      - Creating and publishing: libraries/creating.md
+      - Using libraries: libraries/using.md
   - Development:
       - Release Smoke Tests: development/release-smoke-tests.md
       - Upstream Sync: development/upstream-sync.md
+      - Reusing Qt Elements in PythonSCAD:
+          - .pythonscadrc and add_menuitem: development/pythonscadrc-and-menuitems.md
+          - PyQt6 and Forms in PythonSCAD: development/pyqt6-and-forms.md
+          - Extend Your Design with an Interactive Form: development/extend-with-interactive-form.md
+          - Custom Customizer Widgets: development/custom-customizer-widgets.md
   - Building: building.md
   - WebAssembly:
       - Building for WebAssembly: building-wasm.md
@@ -96,6 +110,7 @@ nav:
       - Align and Handles: reference/align.md
       - Roof: reference/roof.md
       - Fillet: reference/fillet.md
+      - Organic: reference/organic.md
       - Mesh Operations: reference/repair.md
       - GUI and Utility: reference/gui.md
   - Examples: examples.md
@@ -103,6 +118,7 @@ nav:
   - Resources: resources.md
   - Jupyter Setup: jupyter.md
   - Contact: contact.md
+  - Imprint: imprint.md
 
 markdown_extensions:
   - admonition
@@ -117,3 +133,4 @@ markdown_extensions:
   - pymdownx.inlinehilite
   - pymdownx.snippets
   - attr_list
+  - md_in_html

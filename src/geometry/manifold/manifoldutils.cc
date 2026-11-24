@@ -28,7 +28,6 @@
 #ifdef ENABLE_CGAL
 #include "geometry/cgal/cgalutils.h"
 #endif
-#include "src/core/ColorUtil.h"
 
 using Error = manifold::Manifold::Error;
 
@@ -57,7 +56,7 @@ std::shared_ptr<ManifoldGeometry> createManifoldFromTriangularPolySet(const Poly
   for (size_t i = 0, n = ps.indices.size(); i < n; i++) {
     auto color_index = i < ps.color_indices.size() ? ps.color_indices[i] : -1;
     std::optional<Color4f> color;
-    if (color_index >= 0) {
+    if (color_index >= 0 && ps.colors[color_index] != Color4f()) {
       color = ps.colors[color_index];
     }
     colorToFaceIndices[color].push_back(i);
@@ -98,6 +97,18 @@ std::shared_ptr<ManifoldGeometry> createManifoldFromTriangularPolySet(const Poly
     } else if (mani.Status() == Error::NoError && !merged) {
       PRINTD("..unable to merge, but somehow succeeded anyway?");
     }
+  }
+
+  // A closed mesh with all faces pointing inwards is still a valid manifold, but it
+  // has negative volume and booleans with it give wrong results (#7201). Flip it,
+  // like the CGAL backend does.
+  if (mani.Status() == Error::NoError && mani.Volume() < 0) {
+    for (size_t i = 0; i + 2 < mesh.triVerts.size(); i += 3) {
+      std::swap(mesh.triVerts[i + 1], mesh.triVerts[i + 2]);
+    }
+    mani = manifold::Manifold(mesh);
+    // Reversing every triangle keeps the mesh manifold.
+    assert(mani.Status() == Error::NoError);
   }
 
   return std::make_shared<ManifoldGeometry>(mani, originalIDs, originalIDToColor);
@@ -215,7 +226,6 @@ Polygon2d polygonsToPolygon2d(const manifold::Polygons& polygons)
     for (const auto& v : polygon) {
       outline.vertices.emplace_back(v[0], v[1]);
     }
-    outline.color = *OpenSCAD::parse_color("#f9d72c");
     poly2d.addOutline(std::move(outline));
   }
   return poly2d;
@@ -243,7 +253,7 @@ std::unique_ptr<PolySet> createTriangulatedPolySetFromPolygon2d(const Polygon2d&
     manifold::SimplePolygon simplePolygon;
 
     Color4f col = outline_work[0].color;
-    polyset->colors.push_back(col);
+    polyset->colors.push_back(col.unpaintedIfFullyTransparent());
     for (const auto& outline : outline_work) {
       if (outline.color != col) {
         outline_next.push_back(outline);

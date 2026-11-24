@@ -1340,7 +1340,17 @@
              </font>
             </property>
             <property name="text">
-             <string>Features</string>
+             <string>Experimental Features</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="labelFeaturesDisclaimer">
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+            <property name="text">
+             <string>These features are experimental.  They may change or be removed entirely without notice. You may enable them and use them and comment on them, but you must assume that they may not be in their final form and may never appear in an OpenSCAD release in any form.</string>
             </property>
            </widget>
           </item>
@@ -2317,13 +2327,6 @@
                 </widget>
                </item>
                <item>
-                <widget class="QCheckBox" name="launcherBox">
-                 <property name="text">
-                  <string>Show Welcome Screen</string>
-                 </property>
-                </widget>
-               </item>
-               <item>
                 <widget class="QCheckBox" name="localizationCheckBox">
                  <property name="text">
                   <string>Enable user interface localization (requires restart of PythonSCAD)</string>
@@ -2893,6 +2896,43 @@
              </widget>
             </item>
             <item>
+             <widget class="QGroupBox" name="groupBox_Network">
+              <property name="title">
+               <string>Network</string>
+              </property>
+              <layout class="QVBoxLayout" name="verticalLayout_Network">
+               <item>
+                <layout class="QHBoxLayout" name="horizontalLayoutCaCertPath">
+                 <item>
+                  <widget class="QLabel" name="labelCaCertPath">
+                   <property name="text">
+                    <string>Custom CA certificates (PEM)</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QLineEdit" name="lineEditCaCertPath"/>
+                 </item>
+                 <item>
+                  <widget class="QToolButton" name="toolButtonCaCertBrowse">
+                   <property name="text">
+                    <string>...</string>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="checkBoxTlsSkipVerify">
+                 <property name="text">
+                  <string>Skip TLS certificate verification (insecure)</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
              <spacer name="verticalSpacerAdvanced">
               <property name="orientation">
                <enum>Qt::Vertical</enum>
@@ -2965,25 +3005,14 @@
           </property>
          </widget>
          <layout class="QGridLayout" name="gridLayout_p">
-          <item row="0" column="1">
-           <widget class="QLabel" name="labelNetworkImport">
-            <property name="text">
-             <string>Network Import List</string>
-            </property>
-           </widget>
-          </item>
-          <item row="0" column="2">
-           <widget class="QTextEdit" name="textEditPythonImportList">
-           </widget>
-          </item>
-	  <item row="1" column="1">
+	  <item row="0" column="1">
            <widget class="QLabel" name="labelGlobalTrustPython">
             <property name="text">
              <string>Globally trust Python designs</string>
             </property>
            </widget>
           </item>
-	  <item row="1" column="2">
+	  <item row="0" column="2">
             <widget class="QCheckBox" name="checkBoxGlobalTrustPython">
              <property name="text">
               <string>Really (very dangerous)</string>
@@ -3084,6 +3113,13 @@
           </property>
           <layout class="QVBoxLayout" name="verticalLayout_19">
            <item>
+            <widget class="QCheckBox" name="launcherBox">
+             <property name="text">
+              <string>Always show Welcome screen</string>
+             </property>
+            </widget>
+           </item>
+           <item>
             <widget class="QCheckBox" name="checkBoxAlwaysShowExportPdfDialog">
              <property name="text">
               <string>Always show PDF export dialog</string>
@@ -3100,7 +3136,7 @@
            <item>
             <widget class="QCheckBox" name="checkBoxAlwaysShowExportSvgDialog">
              <property name="text">
-              <string>Always show SVF export dialog</string>
+              <string>Always show SVG export dialog</string>
              </property>
             </widget>
            </item>
@@ -3463,7 +3499,7 @@
      <normaloff>:/icons/prefsFeatures.png</normaloff>:/icons/prefsFeatures.png</iconset>
    </property>
    <property name="text">
-    <string>Features</string>
+    <string>Experimental</string>
    </property>
    <property name="toolTip">
     <string>Enable/Disable experimental features</string>

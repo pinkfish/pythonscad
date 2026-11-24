@@ -185,7 +185,7 @@ bool handle_triangle_color(PLib3MFPropertyHandler *propertyhandler, const std::u
       }
     }
   } else if (ctx.usecolors) {
-    const auto& col = ps->colors[color_index];
+    const auto col = ps->colors[color_index].resolved(ctx.defaultColor, ctx.info.defaultCutoutColor());
     if (lib3mf_propertyhandler_setsinglecolorfloatrgba(propertyhandler, triangle_index, col.r(), col.g(),
                                                        col.b(), col.a()) != LIB3MF_OK) {
       export_3mf_error("Can't set triangle color.", ctx.model);
@@ -271,11 +271,23 @@ bool append_polyset(const std::shared_ptr<const PolySet>& ps, const Export3mfPar
     }
   }
 
-  for (const auto& poly : sorted_ps->indices) {
+  // lib3mf triangle ids are dense among accepted triangles. Record the
+  // source-face → lib3mf-id map so the color pass below does not address
+  // a skipped (degenerate) slot.
+  std::vector<int> libTriangleIndex(sorted_ps->indices.size(), -1);
+  int nextLibTriangle = 0;
+  for (size_t face = 0; face < sorted_ps->indices.size(); ++face) {
+    const auto& poly = sorted_ps->indices[face];
+    // lib3mf rejects a triangle whose vertex indices are not unique
+    // ("The provided Index is invalid") and aborts the whole file.
+    if (poly.size() < 3 || poly[0] == poly[1] || poly[1] == poly[2] || poly[0] == poly[2]) {
+      continue;
+    }
     if (!triangleFunc(poly)) {
       export_3mf_error("Can't add triangle to 3MF model.", ctx.model);
       return false;
     }
+    libTriangleIndex[face] = nextLibTriangle++;
   }
 
   std::vector<DWORD> materialMap;
@@ -309,7 +321,8 @@ bool append_polyset(const std::shared_ptr<const PolySet>& ps, const Export3mfPar
     // material table maintained in the export context.
     materialMap.reserve(sorted_ps->colors.size());
     for (const auto& color : sorted_ps->colors) {
-      materialMap.push_back(materialFunc(ctx, color));
+      materialMap.push_back(
+        materialFunc(ctx, color.resolved(ctx.defaultColor, ctx.info.defaultCutoutColor())));
     }
   }
 
@@ -320,8 +333,9 @@ bool append_polyset(const std::shared_ptr<const PolySet>& ps, const Export3mfPar
   }
 
   for (size_t i = 0; i < sorted_ps->color_indices.size(); ++i) {
+    if (i >= libTriangleIndex.size() || libTriangleIndex[i] < 0) continue;
     const int32_t idx = sorted_ps->color_indices[i];
-    if (!handle_triangle_color(propertyhandler, sorted_ps, i, idx, materialMap, ctx)) {
+    if (!handle_triangle_color(propertyhandler, sorted_ps, libTriangleIndex[i], idx, materialMap, ctx)) {
       return false;
     }
   }

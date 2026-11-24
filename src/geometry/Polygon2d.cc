@@ -1,5 +1,7 @@
 #include "geometry/Polygon2d.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <memory>
 #include <sstream>
@@ -396,7 +398,7 @@ void Polygon2d::stamp_color(const Polygon2d& src)
   for (int i = 0; i < theoutlines.size(); i++) {
     //  if (self_a[i] < 0) continue;  // negative area cannot have color
     for (int j = 0; j < src.theoutlines.size(); j++) {
-      if (src.theoutlines[j].color.r() < 0) continue;
+      if (src.theoutlines[j].color.r() < 0 && !src.theoutlines[j].color.isDefaultCutout()) continue;
       if (self_b[i].min()[0] > src_b[j].max()[0]) continue;
       if (self_b[i].max()[0] < src_b[j].min()[0]) continue;
       if (self_b[i].min()[1] > src_b[j].max()[1]) continue;
@@ -419,7 +421,7 @@ void Polygon2d::stamp_color(const Polygon2d& src)
           if (k == i) continue;
           Vector2d pt = theoutlines[k].vertices[0];
           Polygon2d testpol(theoutlines[i]);
-          if (!testpol.point_inside(pt)) continue;
+          if (testpol.point_location(pt) < PointLocation2d::OnVertex) continue;
           theoutlines[k].color = src.theoutlines[j].color;
         }
       }
@@ -469,26 +471,75 @@ void Polygon2d::stamp_color(const Outline2d& src)
   }
 }
 
-bool Polygon2d::point_inside(const Vector2d& pt) const
+PointLocation2d Polygon2d::point_location(const Vector2d& pt, double eps) const
 {
-  // polygons are clockwise
+  const double eps2 = eps * eps;
+  const auto& outs = outlines();
+
+  // Prefer OnVertex when the point is within eps of a corner.
+  for (const auto& outline : outs) {
+    for (const Vector2d& v : outline.vertices) {
+      if ((pt - v).squaredNorm() <= eps2) return PointLocation2d::OnVertex;
+    }
+  }
+
+  for (const auto& outline : outs) {
+    const auto& verts = outline.vertices;
+    const size_t n = verts.size();
+    if (n < 2) continue;
+    for (size_t i = 0; i < n; i++) {
+      const Vector2d& a = verts[i];
+      const Vector2d& b = verts[(i + 1) % n];
+      const Vector2d ab = b - a;
+      const double len2 = ab.squaredNorm();
+      double t = 0.0;
+      if (len2 > 1e-24) {
+        t = std::clamp((pt - a).dot(ab) / len2, 0.0, 1.0);
+      }
+      const Vector2d closest = a + t * ab;
+      if ((pt - closest).squaredNorm() <= eps2) return PointLocation2d::OnEdge;
+    }
+  }
+
+  // Even-odd ray cast over transform-aware outlines.
   int cuts = 0;
-  for (const auto& o : theoutlines) {
-    int n = o.vertices.size();
+  for (const auto& o : outs) {
+    const int n = static_cast<int>(o.vertices.size());
     for (int i = 0; i < n; i++) {
-      Vector2d p1 = o.vertices[i];
-      Vector2d p2 = o.vertices[(i + 1) % n];
-      if (fabs(p1[1] - p2[1]) > 1e-9) {         // not horizotal
-        if (pt[1] <= p1[1] && pt[1] > p2[1]) {  // p2 ... pt .. p1
-          double x = p1[0] + (p2[0] - p1[0]) * (pt[1] - p1[1]) / (p2[1] - p1[1]);
+      const Vector2d& p1 = o.vertices[i];
+      const Vector2d& p2 = o.vertices[(i + 1) % n];
+      if (std::fabs(p1[1] - p2[1]) > 1e-9) {
+        // Half-open interval test so a ray passing exactly through a shared
+        // vertex is attributed to exactly one of its two adjacent edges,
+        // whichever the vertex's y-value truly borders - regardless of
+        // whether that vertex is an ordinary pass-through point or a local
+        // extremum (e.g. the very top/bottom of a hole outline's own
+        // rounded boundary, where BOTH neighbors sit on the same side).
+        // That requires opposite strictness on the two endpoints of each
+        // branch: the case below previously used '<=' on p1 together with
+        // strict '>' on p2, which is backwards - it should be the near
+        // (this-edge-owns-it) endpoint that is checked strictly and the far
+        // endpoint non-strictly, matching the second branch below exactly
+        // (just with p1/p2 swapped). With the endpoints' strictness
+        // swapped as they were, a ray through a local-extremum vertex could
+        // get double- or zero-counted across its two adjacent edges instead
+        // of the required even (0 or 2) total, silently flipping even-odd
+        // parity for the remainder of that ray and misclassifying every
+        // point further along it as outside when it was actually inside
+        // (or vice versa) - reproduced and confirmed via a hole ring's own
+        // v-extremum vertex, and fixed by swapping '<=' and '>' below to
+        // match the non-strict/strict pairing the second branch already
+        // uses correctly.
+        if (pt[1] < p1[1] && pt[1] >= p2[1]) {
+          const double x = p1[0] + (p2[0] - p1[0]) * (pt[1] - p1[1]) / (p2[1] - p1[1]);
           if (x > pt[0]) cuts++;
         }
-        if (pt[1] < p2[1] && pt[1] >= p1[1]) {  // p1 .. pt .. p2
-          double x = p1[0] + (p2[0] - p1[0]) * (pt[1] - p1[1]) / (p2[1] - p1[1]);
+        if (pt[1] < p2[1] && pt[1] >= p1[1]) {
+          const double x = p1[0] + (p2[0] - p1[0]) * (pt[1] - p1[1]) / (p2[1] - p1[1]);
           if (x > pt[0]) cuts++;
         }
       }
     }
   }
-  return cuts & 1;
+  return (cuts & 1) ? PointLocation2d::Inside : PointLocation2d::Outside;
 }

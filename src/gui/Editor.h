@@ -4,14 +4,18 @@
 #include <QScrollBar>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryFile>
 #include <QTextEdit>
 #include <QWidget>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "core/IndicatorData.h"
 #include "genlang/language.h"
 #include "gui/parameter/ParameterWidget.h"
+#include "io/export.h"
 
 enum class EditorSelectionIndicatorStatus { SELECTED, IMPACTED };
 
@@ -20,6 +24,17 @@ class EditorInterface : public QWidget
   Q_OBJECT
 public:
   EditorInterface(QWidget *parent) : QWidget(parent) {}
+  virtual ~EditorInterface() { clearTemporaryFile(); }
+
+  void clearTemporaryFile()
+  {
+    if (this->tempFile) {
+      parameterWidget->removeBackupFile(this->tempFile->fileName());
+      delete this->tempFile;
+      this->tempFile = nullptr;
+    }
+  }
+
   QSize sizeHint() const override
   {
     QSize size;
@@ -113,13 +128,14 @@ public slots:
   virtual void nextBookmark() = 0;
   virtual void prevBookmark() = 0;
   virtual void jumpToNextError() = 0;
+  virtual void moveLineUp() = 0;
+  virtual void moveLineDown() = 0;
 
 private:
   QSize initialSizeHint;
 
 public:
   bool contentsRendered;  // Set if the source code has changes since the last render (F6)
-  int findState;
   QString filepath;
   /// True after loading from an existing file on disk or a successful save to this path.
   bool diskBacked = false;
@@ -129,4 +145,18 @@ public:
   ParameterWidget *parameterWidget;
   int language = LANG_SCAD;
   bool languageManuallySet = false;
+
+  /// Last successful GUI export for this tab (used by Export / Export to …).
+  struct LastExport {
+    QString path;
+    FileFormat format = FileFormat::ASCII_STL;
+    std::shared_ptr<const ExportPdfOptions> optionsPdf;
+    std::shared_ptr<const Export3mfOptions> options3mf;
+    std::shared_ptr<const ExportSvgOptions> optionsSvg;
+    std::shared_ptr<const ExportGcodeOptions> optionsGcode;
+  };
+  std::optional<LastExport> lastExport;
+  /// Session-only metadata changed since the canonical session file was saved.
+  bool sessionMetadataModified = false;
+  QTemporaryFile *tempFile{nullptr};
 };

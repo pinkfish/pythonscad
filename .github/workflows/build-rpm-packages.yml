@@ -25,7 +25,7 @@ permissions:
 jobs:
   prepare-matrix:
     name: Prepare build matrix from supported distributions
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -115,6 +115,21 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false
+
+      - name: DEBUG - Python versions available
+        if: matrix.arch == 'amd64'
+        run: |
+          for v in python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+            if command -v "$v" >/dev/null; then
+              echo "$v: $($v --version)"
+            else
+              echo "$v: nicht gefunden"
+            fi
+          done
+          echo "--- dnf verfügbare python3.1x Pakete ---"
+          dnf list available 2>/dev/null | grep -E '^python3\.(1[0-3])' || echo "keine gefunden"
+          echo "--- rpm %python3_version ---"
+          rpm -E %python3_version
 
       - name: Fetch tags for version detection
         run: |
@@ -455,7 +470,7 @@ jobs:
   publish-yum-repo:
     name: Publish YUM repository to SFTP
     needs: build-rpm
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     if: github.event_name == 'release' || github.event.inputs.upload_to_release != ''
 
     steps:

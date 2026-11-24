@@ -85,9 +85,10 @@
 #include "gui/QSettingsCached.h"
 #include "gui/SettingsWriter.h"
 
-static const char *featurePropertyName = "FeatureProperty";
-
 namespace {
+
+const char *featurePropertyName = "FeatureProperty";
+
 QString getAISettingsFilePath()
 {
   QString configPath = QString::fromStdString(PlatformUtils::userConfigPath());
@@ -115,6 +116,9 @@ nlohmann::json readAISettings()
 
 void writeAISettings(const nlohmann::json& j)
 {
+  if (!Feature::ExperimentalAiFeatures.is_enabled()) {
+    return;
+  }
   QFile file(getAISettingsFilePath());
   if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
     std::string s = j.dump(4);
@@ -122,6 +126,7 @@ void writeAISettings(const nlohmann::json& j)
     file.close();
   }
 }
+
 }  // namespace
 
 using S = Settings::Settings;
@@ -349,6 +354,9 @@ void Preferences::init()
           "6. **Tone**: Technical, concise, and helpful. Avoid long conversational filler.";
         params["default_prompt"] = "Create a sphere with radius 10 and detail level $fn=50.";
         params["context_limit"] = 10;
+        params["payload_limit"] = 50000;
+        params["auto_attach_viewport"] = false;
+        params["max_auto_turns"] = 5;
       }
       prof["params"] = params;
       prof["apiKey"] = "";
@@ -472,8 +480,6 @@ void Preferences::init()
     ->setText(QString::fromStdString(Settings::Settings::localAppExecutable.value()));
   BlockSignals<QLineEdit *>(this->lineEditLocalAppTempDir)
     ->setText(QString::fromStdString(Settings::Settings::localAppTempDir.value()));
-  BlockSignals<QTextEdit *>(this->textEditPythonImportList)
-    ->setText(QString::fromStdString(Settings::SettingsPython::pythonNetworkImportList.value()));
   this->comboBoxOctoPrintSlicingEngine->clear();
   this->comboBoxOctoPrintSlicingEngine->addItem(_("<Default>"), QVariant{""});
   if (!slicer.isEmpty()) {
@@ -506,6 +512,12 @@ void Preferences::update()
     Settings::SettingsExportSvg::exportSvgAlwaysShowDialog.value());
   this->checkBoxAlwaysShowExportGcodeDialog->setChecked(
     Settings::SettingsExportGcode::exportGcodeAlwaysShowDialog.value());
+  // Export as… always prompts for options; remembered Export reuses last options — these
+  // preferences no longer change behavior, so hide them to avoid a misleading UI.
+  this->checkBoxAlwaysShowExportPdfDialog->setVisible(false);
+  this->checkBoxAlwaysShowExport3mfDialog->setVisible(false);
+  this->checkBoxAlwaysShowExportSvgDialog->setVisible(false);
+  this->checkBoxAlwaysShowExportGcodeDialog->setVisible(false);
   this->checkBoxAlwaysShowPrintServiceDialog->setChecked(
     Settings::Settings::printServiceAlwaysShowDialog.value());
   this->checkBoxGlobalTrustPython->setChecked(Settings::SettingsPython::globalTrustPython.value());
@@ -1196,6 +1208,31 @@ void Preferences::on_enableHidapiTraceCheckBox_toggled(bool checked)
   writeSettings();
 }
 
+void Preferences::on_lineEditCaCertPath_editingFinished()
+{
+  Settings::Settings::caCertPath.setValue(this->lineEditCaCertPath->text().toStdString());
+  writeSettings();
+}
+
+void Preferences::on_toolButtonCaCertBrowse_clicked()
+{
+  const QString fileName =
+    QFileDialog::getOpenFileName(this, _("Select CA certificate"), QString{},
+                                 _("Certificate files (*.pem *.crt *.cer);;All files (*)"));
+  if (fileName.isEmpty()) {
+    return;
+  }
+
+  this->lineEditCaCertPath->setText(fileName);
+  on_lineEditCaCertPath_editingFinished();
+}
+
+void Preferences::on_checkBoxTlsSkipVerify_toggled(bool checked)
+{
+  Settings::Settings::tlsSkipVerify.setValue(checked);
+  writeSettings();
+}
+
 void Preferences::on_checkBoxEnableRemotePrintServices_toggled(bool checked)
 {
   S::enableRemotePrintServices.setValue(checked);
@@ -1385,13 +1422,6 @@ void Preferences::updateLocalAppParams()
     }
   }
   Settings::Settings::localAppParameterList.setValue(items);
-  writeSettings();
-}
-
-void Preferences::on_textEditPythonImportList_textChanged()
-{
-  Settings::SettingsPython::pythonNetworkImportList.setValue(
-    this->textEditPythonImportList->document()->toPlainText().toStdString());
   writeSettings();
 }
 
@@ -1633,6 +1663,9 @@ void Preferences::on_pushButtonAINewProfile_clicked()
     "6. **Tone**: Technical, concise, and helpful. Avoid long conversational filler.";
   params["default_prompt"] = "Create a sphere with radius 10 and detail level $fn=50.";
   params["context_limit"] = 10;
+  params["payload_limit"] = 50000;
+  params["auto_attach_viewport"] = false;
+  params["max_auto_turns"] = 5;
   newProfile["params"] = params;
 
   profilesObj[trimmed.toStdString()] = newProfile;
@@ -1752,6 +1785,15 @@ void Preferences::loadAIParams(const QString& profileName)
   }
   if (!paramsObj.contains("context_limit")) {
     paramsObj["context_limit"] = 10;
+  }
+  if (!paramsObj.contains("payload_limit")) {
+    paramsObj["payload_limit"] = 50000;
+  }
+  if (!paramsObj.contains("auto_attach_viewport")) {
+    paramsObj["auto_attach_viewport"] = false;
+  }
+  if (!paramsObj.contains("max_auto_turns")) {
+    paramsObj["max_auto_turns"] = 5;
   }
 
   std::string sysPrompt = paramsObj.value("system_prompt", "");
@@ -2076,6 +2118,11 @@ void Preferences::updateGUI()
 
   BlockSignals<QCheckBox *>(this->enableHidapiTraceCheckBox)
     ->setChecked(Settings::Settings::inputEnableDriverHIDAPILog.value());
+
+  BlockSignals<QLineEdit *>(this->lineEditCaCertPath)
+    ->setText(QString::fromStdString(Settings::Settings::caCertPath.value()));
+  BlockSignals<QCheckBox *>(this->checkBoxTlsSkipVerify)
+    ->setChecked(Settings::Settings::tlsSkipVerify.value());
   BlockSignals<QCheckBox *>(this->checkBoxEnableAutocomplete)
     ->setChecked(getValue("editor/enableAutocomplete").toBool());
   BlockSignals<QLineEdit *>(this->lineEditCharacterThreshold)

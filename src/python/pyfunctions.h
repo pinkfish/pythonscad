@@ -43,6 +43,7 @@ PyObject *python_polygon(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *python_polyline(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *python_spline(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *python_sheet(PyObject *self, PyObject *args, PyObject *kwargs);
+PyObject *python_patch(PyObject *self, PyObject *args, PyObject *kwargs);
 
 #ifdef ENABLE_LIBFIVE
 PyObject *python_frep(PyObject *self, PyObject *args, PyObject *kwargs);
@@ -207,9 +208,13 @@ PyObject *do_import_python(PyObject *self, PyObject *args, PyObject *kwargs, Imp
 
 #ifndef OPENSCAD_NOGUI
 PyObject *python_nimport(PyObject *self, PyObject *args, PyObject *kwargs);
-PyObject *python_add_menuitem(PyObject *self, PyObject *args, PyObject *kwargs, int mode);
+PyObject *python_add_menuitem(PyObject *self, PyObject *args, PyObject *kwargs);
+PyObject *python_add_parameter_widget(PyObject *self, PyObject *args, PyObject *kwargs);
+
 PyObject *python_qapp_ptr(PyObject *, PyObject *);
 PyObject *python_mainwindow_ptr(PyObject *, PyObject *);
+PyObject *python_editor_get_call_args(PyObject *, PyObject *);
+PyObject *python_editor_replace_call_args(PyObject *, PyObject *);
 #endif
 
 // Projection and rendering
@@ -242,13 +247,16 @@ PyObject *python_oo_align(PyObject *obj, PyObject *args, PyObject *kwargs);
 PyObject *python_group(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *python_osversion(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *python_osversion_num(PyObject *self, PyObject *args, PyObject *kwargs);
+PyObject *python_fragments(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *python_osversion_string(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *python_osuse(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *python_osinclude(PyObject *self, PyObject *args, PyObject *kwargs);
-PyObject *python_add_parameter(PyObject *self, PyObject *args, PyObject *kwargs, ImportType type);
+PyObject *python_register_parameter(PyObject *self, PyObject *args, PyObject *kwargs);
+PyObject *python_add_parameter(PyObject *self, PyObject *args, PyObject *kwargs);
+PyObject *python_set_modal_dialog_active(PyObject *, PyObject *args);
 PyObject *python_scad(PyObject *self, PyObject *args, PyObject *kwargs);
-PyObject *python_model(PyObject *self, PyObject *args, PyObject *kwargs, int mode);
-PyObject *python_modelpath(PyObject *self, PyObject *args, PyObject *kwargs, int mode);
+PyObject *python_model(PyObject *self, PyObject *args, PyObject *kwargs);
+PyObject *python_modelpath(PyObject *self, PyObject *args, PyObject *kwargs);
 
 // Object methods
 PyObject *python_oo_clone(PyObject *self, PyObject *args, PyObject *kwargs);
@@ -281,12 +289,12 @@ PyObject *python_debug_modifier(PyObject *arg, int mode);
 int python_tomatrix(PyObject *pyt, Matrix4d& mat);
 int python_tovector(PyObject *pyt, Vector3d& vec);
 PyObject *python_frommatrix(const Matrix4d& mat);
-PyObject *python_fromvector(const Vector3d vec);
+PyObject *python_fromvector(const Vector3d vec, int dim = 3);
 
 // Transform helper functions
 PyObject *python_translate_sub(PyObject *obj, Vector3d translatevec, int dragflags);
 PyObject *python_rotate_sub(PyObject *obj, Vector3d vec3, double angle, int dragflags);
-PyObject *python_scale_sub(PyObject *obj, Vector3d scalevec);
+PyObject *python_scale_sub(PyObject *obj, Vector3d scalevec, int dragflags = 0);
 PyObject *python_mirror_sub(PyObject *obj, Matrix4d& m);
 PyObject *python_multmatrix_sub(PyObject *pyobj, PyObject *pymat, int div);
 

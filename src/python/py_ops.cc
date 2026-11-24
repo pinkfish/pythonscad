@@ -223,15 +223,16 @@ PyObject *python_oo_wrap(PyObject *obj, PyObject *args, PyObject *kwargs)
     PyErr_SetString(PyExc_TypeError, "error during parsing wrap\n");
     return NULL;
   }
-  std::vector<double> xsteps;
-  xsteps.push_back(4);
-  xsteps.push_back(6);
 
   return python_wrap_core(obj, target, r, d, fn, fa, fs);
 }
 
 PyObject *python_color_core(PyObject *obj, PyObject *color, double alpha)
 {
+  if (color == nullptr) {
+    PyErr_SetString(PyExc_TypeError, "No color specified");
+    return NULL;
+  }
   PyObject *child_dict_raw = nullptr;
   std::shared_ptr<AbstractNode> child;
   PyTypeObject *type = PyOpenSCADObjectType(obj);

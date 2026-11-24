@@ -33,7 +33,6 @@
 #include "pyconversion.h"
 #include "primitives.h"
 #include "pydata.h"
-// #include "Geometry.h"
 #include "PolySet.h"
 #include "PolySetBuilder.h"
 #include "GeometryEvaluator.h"
@@ -42,6 +41,8 @@
 #endif
 #include "core/FreetypeRenderer.h"
 #include "core/TextNode.h"
+#include "core/PatchNode.h"
+#include <Tree.h>
 
 PyObject *python_edge(PyObject *self, PyObject *args, PyObject *kwargs)
 {
@@ -101,7 +102,14 @@ PyObject *python_cube(PyObject *self, PyObject *args, PyObject *kwargs)
     return NULL;
   }
 
-  if (size != NULL) {
+  if (size != NULL && (size->ob_type == &PyDataType || PyUnicode_Check(size))) {
+    // scalar marked size: cube(marked(10)) or cube("10")
+    if (python_numberval(size, &(node->dim[0]), &(node->dragflags), 8)) {
+      PyErr_SetString(PyExc_TypeError, "Invalid Cube dimensions");
+      return NULL;
+    }
+    node->dim[1] = node->dim[2] = node->dim[0];
+  } else if (size != NULL) {
     if (python_vectorval(size, 3, 3, &(node->dim[0]), &(node->dim[1]), &(node->dim[2]), nullptr,
                          &(node->dragflags))) {
       PyErr_SetString(PyExc_TypeError, "Invalid Cube dimensions");
@@ -466,22 +474,34 @@ PyObject *python_sphere(PyObject *self, PyObject *args, PyObject *kwargs)
 {
   DECLARE_INSTANCE();
 
-  char *kwlist[] = {"r", "d", NULL};
+  char *kwlist[] = {"r", "d", "style", NULL};
   double r = NAN;
   PyObject *rp = nullptr;
   double d = NAN;
+  PyObject *dp = nullptr;
+  const char *style = nullptr;
 
   double vr = 1;
 
   auto discretizer = CreateCurveDiscretizer(kwargs);
   auto node = std::make_shared<SphereNode>(instance, discretizer);
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|Od", kwlist, &rp, &d)) {
-    PyErr_SetString(PyExc_TypeError, "Error during parsing sphere(r|d)");
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OOs", kwlist, &rp, &dp, &style)) {
+    PyErr_SetString(PyExc_TypeError, "Error during parsing sphere(r|d, style)");
+    return NULL;
+  }
+  // d may be a marked value ("10", marked(10)) to make it draggable
+  if (dp != nullptr && python_numberval(dp, &d, &(node->dragflags), 2)) {
+    PyErr_SetString(PyExc_TypeError, "Error during parsing sphere(r|d, style)");
     return NULL;
   }
   if (rp != nullptr) {
     if (python_numberval(rp, &r, &(node->dragflags), 1))
       if (rp->ob_type == &PyFunction_Type) node->r_func = rp;
+    {
+      Py_INCREF(rp);
+
+      node->func_hash = python_func_hash(rp);  // neu
+    }
   }
   if (!isnan(r)) {
     if (r <= 0) {
@@ -504,6 +524,15 @@ PyObject *python_sphere(PyObject *self, PyObject *args, PyObject *kwargs)
 
   node->r = vr;
 
+  if (style != nullptr) {
+    if (strcmp(style, "orig") != 0 && strcmp(style, "octa") != 0) {
+      PyErr_SetString(PyExc_TypeError,
+                      "Unknown value for style parameter, must be \"orig\" or \"octa\"");
+      return NULL;
+    }
+    node->style = style;
+  }
+
   python_retrieve_pyname(node);
   return PyOpenSCADObjectFromNode(&PyOpenSCADType, node);
 }
@@ -521,13 +550,15 @@ PyObject *python_cylinder(PyObject *self, PyObject *args, PyObject *kwargs)
   double d1 = NAN;
   double d2 = NAN;
   double angle = NAN;
+  PyObject *r1_ = nullptr, *r2_ = nullptr, *d_ = nullptr, *d1_ = nullptr, *d2_ = nullptr,
+           *angle_ = nullptr;
 
   PyObject *center = NULL;
   double vr1 = 1, vr2 = 1, vh = 1;
 
   auto discretizer = CreateCurveDiscretizer(kwargs);
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OddOOdddd", kwlist, &h_, &r1, &r2, &center, &r_, &d,
-                                   &d1, &d2, &angle)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OOOOOOOOO", kwlist, &h_, &r1_, &r2_, &center, &r_,
+                                   &d_, &d1_, &d2_, &angle_)) {
     PyErr_SetString(PyExc_TypeError, "Error during parsing cylinder(h,r|r1+r2|d1+d2)");
     return NULL;
   }
@@ -535,8 +566,23 @@ PyObject *python_cylinder(PyObject *self, PyObject *args, PyObject *kwargs)
   double h = NAN;
 
   auto node = std::make_shared<CylinderNode>(instance, discretizer);
-  python_numberval(r_, &r, &(node->dragflags), 1);
-  python_numberval(h_, &h, &(node->dragflags), 2);
+  python_numberval(r_, &r, &(node->dragflags), CYL_DRAG_R);
+  python_numberval(h_, &h, &(node->dragflags), CYL_DRAG_H);
+  // These used to be parsed as plain doubles; as objects they may also be
+  // marked values ("10", marked(10)), which makes them draggable.
+  const struct {
+    PyObject *obj;
+    double *val;
+    int flag;
+  } numeric_args[] = {{r1_, &r1, CYL_DRAG_R1}, {r2_, &r2, CYL_DRAG_R2},
+                      {d_, &d, CYL_DRAG_D},    {d1_, &d1, CYL_DRAG_D1},
+                      {d2_, &d2, CYL_DRAG_D2}, {angle_, &angle, CYL_DRAG_ANGLE}};
+  for (const auto& arg : numeric_args) {
+    if (arg.obj != nullptr && python_numberval(arg.obj, arg.val, &(node->dragflags), arg.flag)) {
+      PyErr_SetString(PyExc_TypeError, "Error during parsing cylinder(h,r|r1+r2|d1+d2)");
+      return NULL;
+    }
+  }
 
   if (h <= 0) {
     PyErr_SetString(PyExc_TypeError, "Cylinder height must be positive");
@@ -639,13 +685,15 @@ PyObject *python_polyhedron(PyObject *self, PyObject *args, PyObject *kwargs)
     }
     for (Py_ssize_t i = 0; i < npoints; i++) {
       element = PySequence_Fast_GET_ITEM(seq, i);
+      int pointflags = 0;  // marked coordinates make the vertex draggable
       if (!python_is_sequence(element) ||
-          python_vectorval(element, 3, 3, &point[0], &point[1], &point[2], nullptr, nullptr)) {
+          python_vectorval(element, 3, 3, &point[0], &point[1], &point[2], nullptr, &pointflags)) {
         Py_DECREF(seq);
         PyErr_SetString(PyExc_TypeError, "Coordinate must exactly contain 3 numbers");
         return NULL;
       }
       node->points.push_back(point);
+      node->point_dragflags.push_back(pointflags);
     }
     Py_DECREF(seq);
   } else {
@@ -1135,16 +1183,29 @@ PyObject *python_textmetrics(PyObject *self, PyObject *args, PyObject *kwargs)
 
 int sheetCalcIndInt(PyObject *func, double i, double j, Vector3d& pos)
 {
-  PyObject *args = PyTuple_Pack(2, PyFloat_FromDouble(i), PyFloat_FromDouble(j));
+  PyGILState_STATE gstate = PyGILState_Ensure();
+
+  PyObject *iobj = PyFloat_FromDouble(i);
+  PyObject *jobj = PyFloat_FromDouble(j);
+  PyObject *args = PyTuple_Pack(2, iobj, jobj);
+  Py_DECREF(iobj);
+  Py_DECREF(jobj);
+
   PyObject *pos_p = PyObject_CallObject(func, args);
+  Py_DECREF(args);
+
   if (pos_p == nullptr) {
     std::string errorstr;
     python_catch_error(errorstr);
     PyErr_SetString(PyExc_TypeError, errorstr.c_str());
     LOG(message_group::Error, errorstr.c_str());
+    PyGILState_Release(gstate);
     return 1;
   }
-  return python_vectorval(pos_p, 3, 3, &pos[0], &pos[1], &pos[2], nullptr, nullptr);
+  int result = python_vectorval(pos_p, 3, 3, &pos[0], &pos[1], &pos[2], nullptr, nullptr);
+  Py_DECREF(pos_p);
+  PyGILState_Release(gstate);
+  return result;
 }
 
 int sheetCalcInd(PolySetBuilder& builder, std::vector<Vector3d>& vertices, std::vector<double>& istore,
@@ -1385,8 +1446,9 @@ PyObject *python_sheet_core(PyObject *func, double imin, double imax, double jmi
 {
   DECLARE_INSTANCE();
   auto node = std::make_shared<SheetNode>(instance);
-  // TODO check type of func
   node->func = (void *)func;
+  Py_INCREF(func);
+  node->func_hash = python_func_hash(func);  // neu
   node->imin = imin;
   node->imax = imax;
   node->jmin = jmin;
@@ -1452,5 +1514,197 @@ PyObject *python_organic(PyObject *obj, PyObject *args, PyObject *kwargs)
     return NULL;
   }
   node->d = d;
+  return PyOpenSCADObjectFromNode(&PyOpenSCADType, node);
+}
+
+// 'out' gets the 3D world coordinates of 'shape_obj''s outline (via its
+// cumulative transform). 'out_normal' gets, in parallel, per point, the
+// shape's tangent/departure direction - simply the 2D plane's face
+// normal, rotated into world coordinates (trans.linear() * (0,0,1)) and
+// normalized. For a flat 2D shape this is the same vector at every
+// boundary point; patch() later uses it as the tangent for the cubic
+// blend between two rings (see geometry/patch.h/.cc).
+// 'want_normal' controls whether a tangent is computed at all - see the
+// caller python_patch_parse_ring(). When false, 'out_normal' stays
+// completely empty for this ring, and patch() is guaranteed to fall back
+// to the old, purely linear/barycentric behavior for it. This matters:
+// a 2D shape's plane normal is only a sensible patching tangent when the
+// surface is really meant to "leave" perpendicular to that plane (e.g. a
+// pipe stub on a flange). For an ordinary cone/funnel made from two
+// unrotated circle()s, both rings' plane normal is simply (0,0,1) - that
+// is NOT the direction the cone's wall actually runs in, and would
+// wrongly bow an otherwise-straight wall ("pimple"). That's why tangent
+// evaluation is strictly opt-in (see 'use_tangents' in python_patch())
+// rather than automatically attached to every shape.
+static bool python_patch_ring_from_shape(PyObject *shape_obj, std::vector<Vector3d>& out,
+                                         std::vector<Vector3d>& out_normal, bool want_normal)
+{
+  PyObject *dummydict = nullptr;
+  std::shared_ptr<AbstractNode> child = PyOpenSCADObjectToNodeMulti(shape_obj, &dummydict);
+  auto dummydict_owner = py_owned(dummydict);
+  if (child == nullptr) return false;
+
+  Tree tree(child, "");
+  GeometryEvaluator geomevaluator(tree);
+  std::shared_ptr<const Geometry> geom = geomevaluator.evaluateGeometry(*tree.root(), true);
+  if (PyErr_Occurred()) return false;  // in case the evaluation itself already set a Python exception
+
+  auto poly2d = std::dynamic_pointer_cast<const Polygon2d>(geom);
+  if (poly2d == nullptr) {
+    PyErr_SetString(PyExc_TypeError, "patch(): object is not a 2D shape.");
+    return false;
+  }
+
+  const auto outlines = poly2d->untransformedOutlines();
+  if (outlines.size() != 1 || outlines[0].vertices.size() < 3) {
+    PyErr_SetString(PyExc_TypeError,
+                    "patch(): 2D-shape must exactly have one outline with at least 3 points.");
+
+    return false;
+  }
+  Transform3d trans = poly2d->getTransform3d();
+  const auto& outline = outlines[0];
+
+  out.reserve(out.size() + outline.vertices.size());
+  for (const auto& v : outline.vertices) {
+    out.push_back(trans * Vector3d(v[0], v[1], 0));
+  }
+
+  if (!want_normal) return true;
+
+  Vector3d normal = trans.linear() * Vector3d(0, 0, 1);
+  double nlen = normal.norm();
+  normal = (nlen > 1e-12) ? (normal / nlen) : Vector3d(0, 0, 1);
+
+  out_normal.reserve(out_normal.size() + outline.vertices.size());
+  for (size_t i = 0; i < outline.vertices.size(); i++) out_normal.push_back(normal);
+  return true;
+}
+
+// Helper: a list of [x,y,z] points OR a 2D shape object -> std::vector<Vector3d>.
+// 'out_normal' is filled ONLY when 'ring_obj' is a 2D shape AND
+// 'want_normal' is true (see python_patch_ring_from_shape() above); in
+// all other cases (point list, or a shape without use_tangents=True) it
+// stays empty, i.e. patch() is guaranteed to fall back to the old,
+// purely linear behavior for this boundary.
+static bool python_patch_parse_ring(PyObject *ring_obj, std::vector<Vector3d>& out,
+                                    std::vector<Vector3d>& out_normal, bool want_normal)
+{
+  // New: accept a PyOpenSCAD 2D object directly (its outline is used)
+  if (PyObject_IsInstance(ring_obj, reinterpret_cast<PyObject *>(&PyOpenSCADType))) {
+    return python_patch_ring_from_shape(ring_obj, out, out_normal, want_normal);
+  }
+
+  // Previous behavior: a list of [x,y,z] points - no tangents.
+  out = python_to2dvarpointlist(ring_obj);
+  return true;
+}
+
+PyObject *python_patch(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+  DECLARE_INSTANCE();
+
+  // Order deliberately chosen so the two truly important arguments (the
+  // geometry: 'outer' and 'holes') come first; everything else
+  // (projection, grid resolution, displacement, curvature) is optional
+  // and has a sensible default. 'proj' and 'displacement' remain
+  // addressable by keyword at any time regardless
+  // (patch(outer, proj=myProj, ...)), even though 'holes' comes before them.
+  char *kwlist[] = {"outer", "holes", "proj", "grid_spacing_uv", "displacement", "use_tangents", NULL};
+  PyObject *outer_obj = nullptr;
+  PyObject *holes_obj = nullptr;
+  PyObject *proj_obj = nullptr;
+  double grid_spacing_uv = 1.0;
+  PyObject *displacement_obj = nullptr;
+  PyObject *use_tangents_obj = nullptr;
+
+  // 'proj' is OPTIONAL: omitted or None -> patch() determines the
+  // projection automatically itself (see computeAutoProj() in
+  // geometry/patch.cc - distinguishes "tube between two ports" from
+  // "perforated panel in one plane"). An explicitly given proj always
+  // wins and is used unchanged.
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOdOO", kwlist, &outer_obj, &holes_obj, &proj_obj,
+                                   &grid_spacing_uv, &displacement_obj, &use_tangents_obj)) {
+    PyErr_SetString(PyExc_TypeError,
+                    "Error during parsing patch(outer, holes=None, proj=None, grid_spacing_uv=1.0, "
+                    "displacement=None, use_tangents=False)");
+    return nullptr;
+  }
+
+  // Only when the caller EXPLICITLY passes use_tangents=True is a tangent
+  // derived from the plane normal for shape boundary objects at all (see
+  // python_patch_ring_from_shape()), enabling the cubic curvature.
+  // Default (no argument, or False) = exactly the old, purely linear
+  // behavior - even when outer/holes are 2D shapes. This keeps e.g. a
+  // simple cone made from two circle()s untouched.
+  const bool use_tangents = (use_tangents_obj == Py_True);
+
+  if (proj_obj != nullptr && proj_obj != Py_None && proj_obj->ob_type != &PyFunction_Type) {
+    PyErr_SetString(PyExc_TypeError,
+                    "patch(): proj must be a function, None, or omitted (for "
+                    "automatic projection).");
+    return nullptr;
+  }
+  if (displacement_obj != nullptr && displacement_obj != Py_None &&
+      displacement_obj->ob_type != &PyFunction_Type) {
+    PyErr_SetString(PyExc_TypeError, "patch(): displacement must be a function, None, or omitted.");
+    return nullptr;
+  }
+
+  auto node = std::make_shared<PatchNode>(instance);
+  node->use_tangents = use_tangents;
+
+  if (!python_patch_parse_ring(outer_obj, node->outer, node->outer_normal, use_tangents) ||
+      node->outer.size() < 3) {
+    PyErr_SetString(PyExc_TypeError, "patch(): outer must be a list of at least 3 [x,y,z] points.");
+    return nullptr;
+  }
+
+  if (holes_obj != nullptr && holes_obj != Py_None) {
+    if (!python_is_sequence(holes_obj)) {
+      PyErr_SetString(PyExc_TypeError, "patch(): holes must be a list of point lists.");
+      return nullptr;
+    }
+    PyObject *holeseq = PySequence_Fast(holes_obj, "expected a list of rings");
+    if (holeseq == nullptr) return nullptr;
+    Py_ssize_t nholes = PySequence_Fast_GET_SIZE(holeseq);
+    for (Py_ssize_t i = 0; i < nholes; i++) {
+      std::vector<Vector3d> hole;
+      std::vector<Vector3d> hole_normal;
+      if (!python_patch_parse_ring(PySequence_Fast_GET_ITEM(holeseq, i), hole, hole_normal,
+                                   use_tangents)) {
+        Py_DECREF(holeseq);
+        PyErr_SetString(PyExc_TypeError, "patch(): each hole must be a list of [x,y,z] points.");
+        return nullptr;
+      }
+      if (hole.size() < 3) {
+        Py_DECREF(holeseq);
+        PyErr_SetString(PyExc_TypeError, "patch(): each hole must contain at least 3 [x,y,z] points.");
+        return nullptr;
+      }
+      node->holes.push_back(std::move(hole));
+      node->holes_normal.push_back(std::move(hole_normal));
+    }
+    Py_DECREF(holeseq);
+  }
+
+  node->grid_spacing_uv = grid_spacing_uv;
+
+  if (proj_obj != nullptr && proj_obj != Py_None) {
+    Py_INCREF(proj_obj);
+    node->proj_func = (void *)proj_obj;
+    node->proj_func_hash = python_func_hash(proj_obj);
+  } else {
+    node->proj_func_hash = "auto";
+  }
+
+  if (displacement_obj != nullptr && displacement_obj != Py_None) {
+    Py_INCREF(displacement_obj);
+    node->displacement_func = (void *)displacement_obj;
+    node->displacement_func_hash = python_func_hash(displacement_obj);
+  } else {
+    node->displacement_func_hash = "none";
+  }
+
   return PyOpenSCADObjectFromNode(&PyOpenSCADType, node);
 }

@@ -27,6 +27,7 @@ struct PyOpenSCADBoundMemberObject {
 
 typedef struct {
   PyObject_HEAD double v[3];
+  int dim;  // 2 or 3; trailing components beyond dim are zero
 } PyOpenSCADVectorObject;
 
 void PyObjectDeleter(PyObject *pObject);
@@ -178,6 +179,7 @@ std::vector<Vector3d> python_vectors(PyObject *vec, int mindim, int maxdim);
 int python_numberval(PyObject *number, double *result);
 CurveDiscretizer CreateCurveDiscretizer(PyObject *kwargs);
 PyObject *python_str(PyObject *self);
+std::string python_func_hash(PyObject *func);
 
 extern PyNumberMethods PyOpenSCADNumbers;
 extern PyMappingMethods PyOpenSCADMapping;

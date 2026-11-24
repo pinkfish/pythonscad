@@ -9,9 +9,15 @@ William F. Adams has created a nice
 contains a lot of useful information.
 
 Also check out our own [tutorial](tutorial/getting_started.md).
+For editor completion and call validation, follow the
+[project-local environment setup](installation.md#project-local-environment-for-ide-support);
+the `pythonscad` package includes its type information.
 
-[Python stub files](https://raw.githubusercontent.com/pythonscad/pythonscad/refs/heads/master/libraries/python/stubs/openscad/__init__.pyi)
-for all available functions in PythonSCAD are also available.
+To share or consume reusable geometry as versioned Python packages, see
+[Sharing and using libraries](libraries/index.md).
+
+To send designs to PrusaSlicer (or another slicer) with **F8**, see
+[Slicer integration](slicer-integration.md).
 
 [PyForge](https://pyforge.zima.digirent.nl) is a community platform for
 sharing PythonSCAD designs — similar to Thingiverse, but built

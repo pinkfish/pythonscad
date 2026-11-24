@@ -17,9 +17,9 @@
       <div>Create a rounded cube or box; set center=True to center it</div>
       <div><code>rounded_cube([30, 20, 10], r=2, center=True).show()</code></div>
 
-      <div class="func"><code><a href="../reference/primitives3d/#sphere">sphere</a>(r | d)</code></div>
-      <div>Create a sphere with radius r or diameter d</div>
-      <div><code>sphere(15).show()</code></div>
+      <div class="func"><code><a href="../reference/primitives3d/#sphere">sphere</a>(r | d, style=...)</code></div>
+      <div>Create a sphere; style="octa" uses octahedral tessellation</div>
+      <div><code>sphere(15, style="octa").show()</code></div>
 
       <div class="func"><code><a href="../reference/primitives3d/#cylinder">cylinder</a>(h, r|d, center)</code></div>
       <div>Create a cylinder or cone with height h and radii</div>
@@ -36,6 +36,11 @@
       <div class="func"><code><a href="../reference/sheet/#sheet">sheet</a>(func, imin, imax, ...)</code></div>
       <div>Generate a 3D surface from a Python function</div>
       <div><code>sheet(myfunc, 0, 10, 0, 10).show()</code></div>
+
+      <div class="func"><code><a href="../reference/primitives3d/#patch">patch</a>(outer, holes, proj, grid_spacing_uv, displacement, use_tangents)</code></div>
+      <div>Build a surface from an outer ring and optional hole rings</div>
+      <div><code>patch(circle(10), holes=[circle(6).up(30)]).show()</code></div>
+
   </div>
 </div>
 
@@ -52,11 +57,11 @@
       <div><code>circle(r=5, angle=90).show()</code></div>
 
       <div class="func"><code><a href="../reference/primitives2d/#polygon">polygon</a>(points, paths)</code></div>
-      <div>Create a 2D polygon from a list of points</div>
-      <div><code>polygon([[0,0], [10,0], [5,10]]).show()</code></div>
+      <div>Create a 2D polygon; optional <code>[x,y,r]</code> rounds a corner</div>
+      <div><code>polygon([[0,0], [10,0,2], [5,10]]).show()</code></div>
 
       <div class="func"><code><a href="../reference/primitives2d/#polyline">polyline</a>(points)</code></div>
-      <div>Create an open 2D polyline (e.g. for laser cutting)</div>
+      <div>Create an open 2D/3D polyline (e.g. for laser cutting)</div>
       <div><code>polyline([[0,0], [10,0], [5,10]]).show()</code></div>
 
       <div class="func"><code><a href="../reference/primitives2d/#spline">spline</a>(points, fn)</code></div>
@@ -128,8 +133,8 @@
       <div><code>cube(5).pull([1,1,3], [4,-2,5]).show()</code></div>
 
       <div class="func"><code><a href="../reference/wrap/#wrap">wrap</a>(obj, target, r|d)</code></div>
-      <div>Wrap a flat object around a cylinder</div>
-      <div><code>square(10).wrap(cylinder(r=5,h=10)).show()</code></div>
+      <div>Wrap a flat object around a circle or 2D outline</div>
+      <div><code>cube([20,1,10]).wrap(20).show()</code></div>
 
       <div class="func"><code><a href="../reference/align/#align">align</a>(obj, refmat, objmat, flip)</code></div>
       <div>Align object to a handle / reference matrix</div>
@@ -167,8 +172,8 @@
       <div>Subtract obj2 from obj1; optionally fillet with r</div>
       <div><code>difference(cube(10), sphere(7)).show()</code></div>
 
-      <div class="func"><code><a href="../reference/booleans/#intersection">intersection</a>(obj1, obj2)</code></div>
-      <div>Keep only the overlapping volume</div>
+      <div class="func"><code><a href="../reference/booleans/#intersection">intersection</a>(obj1, obj2, r, fn)</code></div>
+      <div>Keep only the overlapping volume; optionally fillet with r</div>
       <div><code>intersection(cube(10), sphere(7)).show()</code></div>
 
       <div class="func"><code><a href="../reference/booleans/#hull">hull</a>(obj1, obj2, ...)</code></div>
@@ -196,6 +201,10 @@
       <div class="func"><code><a href="../reference/extrusions/#linear_extrude">linear_extrude</a>(obj, height, twist, ...)</code></div>
       <div>Extrude a 2D shape or function linearly</div>
       <div><code>circle(5).linear_extrude(height=10).show()</code></div>
+
+      <div class="func"><code><a href="../reference/extrusions/#loft">loft</a>(shape1, shape2, height, n, rot)</code></div>
+      <div>Interpolate between two centered 2D cross-sections</div>
+      <div><code>linear_extrude(loft(square(10, center=True), circle(3), 20), height=20, slices=20).show()</code></div>
 
       <div class="func"><code><a href="../reference/extrusions/#rotate_extrude">rotate_extrude</a>(obj, angle, v, ...)</code></div>
       <div>Extrude a 2D shape by rotating; supports helix via v</div>
@@ -396,9 +405,9 @@
       <div>Debug modifiers for visualization</div>
       <div><code>highlight(cube(5)).show()</code></div>
 
-      <div class="func"><code><a href="../reference/multitool/#multitoolexporter">MultiToolExporter</a>(prefix, suffix, mkdir, items)</code></div>
+      <div class="func"><code><a href="../reference/multitool/#multitoolexporter">MultiToolExporter</a>(items)</code></div>
       <div>Split a model into per-color/per-tool files, or one multi-object 3MF</div>
-      <div><code>MultiToolExporter("", "", items=[("r",red),("b",blue)]).export(single_file="m.3mf")</code></div>
+      <div><code>MultiToolExporter(items=[("r",red),("b",blue)]).export(single_file="m.3mf")</code></div>
   </div>
 </div>
 
@@ -407,7 +416,7 @@
 <div class="cheatsheet-section">
   <div class="cheatsheet-grid">
       <div class="func"><code><a href="../reference/io/#osimport">osimport</a>(file, ...)</code></div>
-      <div>Import geometry from file (STL, OFF, AMF, 3MF, SVG, DXF)</div>
+      <div>Import geometry from file (STL, OFF, OBJ, 3MF, STEP, DXF, SVG; NEF3/CDR when built in)</div>
       <div><code>osimport("model.stl").show()</code></div>
 
       <div class="func"><code><a href="../reference/io/#osimport">osimport</a>(file, split_by_color=True)</code></div>
@@ -427,8 +436,8 @@
       <div><code>scad("cube(10);")</code></div>
 
       <div class="func"><code><a href="../reference/io/#nimport">nimport</a>(url)</code></div>
-      <div>Import a model from a network URL (GUI only)</div>
-      <div><code>nimport("https://example.com/model.stl")</code></div>
+      <div>Deprecated (GUI only): download a remote <code>.py</code> and <code>from … import *</code> — use a <a href="../libraries/">Python package</a> instead</div>
+      <div><code>nimport("https://example.com/mylib.py")  # deprecated</code></div>
   </div>
 </div>
 

@@ -1,5 +1,6 @@
 #include "geometry/GeometryEvaluator.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <iterator>
@@ -27,7 +28,6 @@
 #include "core/DebugNode.h"
 #include "core/RepairNode.h"
 #include "core/WrapNode.h"
-#include "glview/ColorMap.h"
 #include "geometry/Barcode1d.h"
 #include "core/State.h"
 #include "core/TextNode.h"
@@ -52,6 +52,7 @@
 #include "glview/RenderSettings.h"
 #include "utils/calc.h"
 #include "utils/degree_trig.h"
+#include "utils/hash.h"
 #include "utils/printutils.h"
 #include "core/ColorUtil.h"
 #include <unordered_map>
@@ -1175,7 +1176,7 @@ std::shared_ptr<const Geometry> offset3D(const std::shared_ptr<const PolySet>& p
     LOG(message_group::Warning,
         "Resulting 3D offset is not manifold anymore, further processing might be inaccurate");
 
-  int abs_eff_fn = 0;
+  int abs_eff_fn = discretizer.getCircularSegmentCount(fabs(off)).value_or(3);
   for (auto& e : edge_db) {
     Vector3d p1 = ps->vertices[e.first.ind1];
     Vector3d p2 = ps->vertices[e.first.ind2];
@@ -1461,8 +1462,8 @@ std::shared_ptr<const Geometry> offset3D(const std::shared_ptr<const PolySet>& p
 }
 
 std::unique_ptr<const Geometry> createFilletInt(std::shared_ptr<const PolySet> ps,
-                                                std::vector<bool> corner_selected, double r, int fn,
-                                                double minang);
+                                                std::vector<bool> corner_selected, double r_, int bn,
+                                                double minang, double min_edge_len = 0);
 
 Vector3d createFilletRound(Vector3d pt)
 {
@@ -1471,28 +1472,276 @@ Vector3d createFilletRound(Vector3d pt)
   double z = ((int)(pt[2] * 1e6)) / 1e6;
   return Vector3d(x, y, z);
 }
+
+namespace {
+
+// Boolean triangulation can leave seam edges too short for a stable fillet
+// patch. Treat edges below 5% of the requested radius as numerical slivers.
+constexpr double FILLET_SLIVER_EDGE_RATIO = 0.05;
+
+bool pointOutsideBounds(const BoundingBox& bounds, const Vector3d& pt, double eps)
+{
+  return bounds.isNull() || (pt.array() < bounds.min().array() - eps).any() ||
+         (pt.array() > bounds.max().array() + eps).any();
+}
+
+bool pointOnTriangle(const Vector3d& pt, const Vector3d& a, const Vector3d& b, const Vector3d& c,
+                     double eps)
+{
+  const Vector3d normal = (b - a).cross(c - a);
+  const double normalSquared = normal.squaredNorm();
+  if (normalSquared < 1e-36 || std::abs((pt - a).dot(normal)) > eps * std::sqrt(normalSquared)) {
+    return false;
+  }
+
+  // Coplanarity alone is insufficient: the point must also be inside the bounded triangle.
+  const double edgeTolerance = -1e-7 * normalSquared;
+  return normal.dot((b - a).cross(pt - a)) >= edgeTolerance &&
+         normal.dot((c - b).cross(pt - b)) >= edgeTolerance &&
+         normal.dot((a - c).cross(pt - c)) >= edgeTolerance;
+}
+
+// True if pt lies on (or within eps of) any triangle of an already-tessellated ps.
+bool pointOnPolySetSurface(const PolySet& ps, const Vector3d& pt, double eps)
+{
+  if (pointOutsideBounds(ps.getBoundingBox(), pt, eps)) return false;
+  for (const auto& ind : ps.indices) {
+    if (ind.size() < 3) continue;
+    const Vector3d a = ps.vertices[ind[0]];
+    const Vector3d b = ps.vertices[ind[1]];
+    const Vector3d c = ps.vertices[ind[2]];
+    BoundingBox triangleBounds;
+    triangleBounds.extend(a);
+    triangleBounds.extend(b);
+    triangleBounds.extend(c);
+    if (pointOutsideBounds(triangleBounds, pt, eps)) continue;
+    if (pointOnTriangle(pt, a, b, c, eps)) return true;
+  }
+  return false;
+}
+
+// Replace a sharp corner with a circular fillet arc. Adapted from
+// PolygonNode::createGeometry_sub; r is clamped so the fillet fits both edges.
+void appendFilletedCorner2D(VectorOfVector2d& out, const Vector2d& ptprev, const Vector2d& ptcur,
+                            const Vector2d& ptnext, double r, int fn)
+{
+  Vector3d dir1(ptcur[0] - ptprev[0], ptcur[1] - ptprev[1], 0);
+  Vector3d dir2(ptnext[0] - ptcur[0], ptnext[1] - ptcur[1], 0);
+  const double len1 = dir1.head<2>().norm();
+  const double len2 = dir2.head<2>().norm();
+  if (len1 < 1e-12 || len2 < 1e-12 || std::fabs(r) < 1e-12) {
+    out.push_back(ptcur);
+    return;
+  }
+
+  const Vector3d cr = dir1.cross(dir2);
+  const double cross_z = cr[2];
+  const double sin_ang = std::fabs(cross_z) / (len1 * len2);
+  if (sin_ang < 1e-6) {
+    out.push_back(ptcur);
+    return;
+  }
+
+  auto try_fillet = [&](double radius) -> bool {
+    Vector3d n1(-dir1[1], dir1[0], 0);
+    Vector3d n2(-dir2[1], dir2[0], 0);
+    n1.normalize();
+    n2.normalize();
+    if (cross_z < 0) {
+      n1 = -n1;
+      n2 = -n2;
+    }
+    const Vector3d pprev(ptprev[0], ptprev[1], 0);
+    const Vector3d pnext(ptnext[0], ptnext[1], 0);
+    Vector3d res;
+    if (linsystem(dir1, cr, dir2, pnext + n2 * radius - pprev - n1 * radius, res, nullptr)) {
+      return false;
+    }
+    if (res[0] <= 1e-9 || res[0] >= 1.0 - 1e-9) return false;
+
+    Vector3d st = pprev + dir1 * res[0];
+    st[2] = 0;
+    const Vector3d cent = st + radius * n1;
+    const Vector3d en = cent - radius * n2;
+
+    // End point must lie on the outgoing edge.
+    const Vector2d en2 = en.head<2>();
+    const Vector2d along = en2 - ptcur;
+    const double t2 = along.dot(dir2.head<2>()) / (len2 * len2);
+    if (t2 <= 1e-9 || t2 >= 1.0 - 1e-9) return false;
+    if ((ptcur + t2 * dir2.head<2>() - en2).squaredNorm() > 1e-12) return false;
+
+    double ang_st = std::atan2(-n1[1], -n1[0]);
+    double ang_en = std::atan2(-n2[1], -n2[0]);
+    if (ang_en - ang_st > M_PI) ang_en -= 2 * M_PI;
+    if (ang_st - ang_en > M_PI) ang_st -= 2 * M_PI;
+
+    out.push_back(st.head<2>());
+    const int segs = std::max(fn, 1);
+    for (int j = 0; j < segs; j++) {
+      const double ang = ang_st + (ang_en - ang_st) * (j + 1) / (segs + 1);
+      out.emplace_back(cent[0] + radius * std::cos(ang), cent[1] + radius * std::sin(ang));
+    }
+    out.push_back(en.head<2>());
+    return true;
+  };
+
+  if (try_fillet(r)) return;
+
+  // Shrink radius so the fillet fits the shorter adjacent edge.
+  const double cos_a =
+    std::clamp(dir1.head<2>().normalized().dot(dir2.head<2>().normalized()), -1.0, 1.0);
+  const double turn_ang = std::atan2(sin_ang, cos_a);
+  if (turn_ang < 1e-6 || turn_ang > M_PI - 1e-6) {
+    out.push_back(ptcur);
+    return;
+  }
+  const double max_dist = std::min(len1, len2) * 0.49;
+  const double max_r = max_dist * std::tan(turn_ang / 2.0);
+  if (max_r < 1e-9 || !try_fillet(max_r)) {
+    out.push_back(ptcur);
+  }
+}
+
+Outline2d filletOutline2D(const Outline2d& outline, const std::vector<bool>& selected, double r, int fn)
+{
+  Outline2d result;
+  result.positive = outline.positive;
+  result.color = outline.color;
+  const auto& verts = outline.vertices;
+  const size_t n = verts.size();
+  if (n < 3 || selected.size() != n) {
+    result.vertices = verts;
+    return result;
+  }
+  for (size_t i = 0; i < n; i++) {
+    if (!selected[i]) {
+      result.vertices.push_back(verts[i]);
+      continue;
+    }
+    appendFilletedCorner2D(result.vertices, verts[(i + n - 1) % n], verts[i], verts[(i + 1) % n], r, fn);
+  }
+  return result;
+}
+
+}  // namespace
+
+std::unique_ptr<Polygon2d> addFillets2D(std::unique_ptr<Polygon2d> result,
+                                        const std::vector<std::shared_ptr<const Polygon2d>>& children,
+                                        double r, int fn)
+{
+  if (!result || children.empty() || r == 0) return result;
+
+  std::vector<std::unordered_set<Vector3d>> child_verts;
+  child_verts.reserve(children.size());
+  for (const auto& child : children) {
+    std::unordered_set<Vector3d> verts;
+    if (child) {
+      for (const auto& outline : child->outlines()) {
+        for (const Vector2d& pt : outline.vertices) {
+          verts.insert(createFilletRound(Vector3d(pt[0], pt[1], 0)));
+        }
+      }
+    }
+    child_verts.push_back(std::move(verts));
+  }
+
+  auto filleted = std::make_unique<Polygon2d>();
+  filleted->setSanitized(result->isSanitized());
+  filleted->setConvexity(result->getConvexity());
+  constexpr double kBoundaryEps = 1e-4;
+
+  for (const auto& outline : result->outlines()) {
+    const size_t n = outline.vertices.size();
+    std::vector<bool> selected(n, false);
+    for (size_t i = 0; i < n; i++) {
+      const Vector2d& pt = outline.vertices[i];
+      const Vector3d rounded = createFilletRound(Vector3d(pt[0], pt[1], 0));
+      int owner = -1;
+      int n_owners = 0;
+      for (size_t c = 0; c < child_verts.size(); c++) {
+        if (child_verts[c].count(rounded)) {
+          owner = static_cast<int>(c);
+          n_owners++;
+        }
+      }
+      bool sel = false;
+      if (n_owners != 1) {
+        // Boolean-created and shared child vertices both lie on the seam.
+        sel = true;
+      } else {
+        for (size_t c = 0; c < children.size(); c++) {
+          if (static_cast<int>(c) == owner || !children[c]) continue;
+          const auto loc = children[c]->point_location(pt, kBoundaryEps);
+          // On the boundary of another child (vertex or edge), not the interior.
+          if (loc >= PointLocation2d::OnVertex && loc <= PointLocation2d::OnEdge) {
+            sel = true;
+            break;
+          }
+        }
+      }
+      selected[i] = sel;
+    }
+    filleted->addOutline(filletOutline2D(outline, selected, std::fabs(r), fn));
+  }
+  for (const auto& pl : result->polylines()) {
+    filleted->addPolyline(pl);
+  }
+
+  // Arc insertion can leave near-collinear vertices; sanitize via Clipper.
+  return ClipperUtils::sanitize(*filleted);
+}
+
 std::unique_ptr<const Geometry> addFillets(std::shared_ptr<const Geometry> result,
                                            const Geometry::Geometries& children, double r, int fn)
 {
-  std::unordered_set<Vector3d> points;
-  Vector3d pt;
   std::shared_ptr<const PolySet> psr = PolySetUtils::getGeometryAsPolySet(result);
-  for (const Vector3d& pt : psr->vertices) {
-    points.insert(createFilletRound(pt));
-  }
 
+  std::vector<std::shared_ptr<const PolySet>> child_ps;
+  std::vector<std::unordered_set<Vector3d>> child_verts;
+  child_ps.reserve(children.size());
+  child_verts.reserve(children.size());
   for (const auto& child : children) {
-    std::shared_ptr<const PolySet> ps = PolySetUtils::getGeometryAsPolySet(child.second);
-    for (const Vector3d& pt : ps->vertices) {
-      points.erase(createFilletRound(pt));
+    auto ps = PolySetUtils::getGeometryAsPolySet(child.second);
+    std::shared_ptr<const PolySet> tess;
+    if (ps) tess = PolySetUtils::tessellate_faces(*ps);
+    child_ps.push_back(tess);
+    std::unordered_set<Vector3d> verts;
+    if (ps) {
+      for (const Vector3d& pt : ps->vertices) verts.insert(createFilletRound(pt));
     }
+    child_verts.push_back(std::move(verts));
   }
 
   std::vector<bool> corner_selected;
-  for (size_t i = 0; i < psr->vertices.size(); i++)
-    corner_selected.push_back(points.count(createFilletRound(psr->vertices[i])) > 0 ? true : false);
+  for (size_t i = 0; i < psr->vertices.size(); i++) {
+    const Vector3d rounded = createFilletRound(psr->vertices[i]);
+    int owner = -1;
+    int n_owners = 0;
+    for (size_t c = 0; c < child_verts.size(); c++) {
+      if (child_verts[c].count(rounded)) {
+        owner = static_cast<int>(c);
+        n_owners++;
+      }
+    }
+    bool sel = false;
+    if (n_owners != 1) {
+      // Boolean-created and shared child vertices both lie on the seam.
+      sel = true;
+    } else {
+      // Original vertex of one child: keep it if it also lies on another child.
+      for (size_t c = 0; c < child_ps.size(); c++) {
+        if (static_cast<int>(c) == owner || !child_ps[c]) continue;
+        if (pointOnPolySetSurface(*child_ps[c], psr->vertices[i], 1e-4)) {
+          sel = true;
+          break;
+        }
+      }
+    }
+    corner_selected.push_back(sel);
+  }
 
-  return createFilletInt(psr, corner_selected, r, fn, 30.0);
+  return createFilletInt(psr, corner_selected, r, fn, 30.0, FILLET_SLIVER_EDGE_RATIO * std::fabs(r));
 }
 
 double concat_round(double x)
@@ -1538,30 +1787,34 @@ GeometryEvaluator::ResultObject GeometryEvaluator::applyToChildren3D(const Abstr
     break;
   }
   case OpenSCADOperator::CONCAT: {
+    PolySetBuilder builder;
+    bool any = false;
     for (const auto& item : children) {
       const auto ps = std::dynamic_pointer_cast<const PolySet>(item.second);
-      if (ps != nullptr) {
-        PolySetBuilder builder;
-        for (size_t i = 0; i < ps->indices.size(); i++) {
-          const auto& face = ps->indices[i];
-          builder.beginPolygon(face.size());
-          for (int ind : face) {
-            Vector3d pt = ps->vertices[ind];
-            pt[0] = concat_round(pt[0]);
-            pt[1] = concat_round(pt[1]);
-            pt[2] = concat_round(pt[2]);
-            builder.addVertex(pt);
-          }
-          if (ps->color_indices.size() > i) builder.endPolygon(ps->colors[ps->color_indices[i]]);
-          else builder.endPolygon();
+      if (ps == nullptr) continue;
+      any = true;
+      for (size_t i = 0; i < ps->indices.size(); i++) {
+        const auto& face = ps->indices[i];
+        builder.beginPolygon(face.size());
+        for (int ind : face) {
+          Vector3d pt = ps->vertices[ind];
+          pt[0] = concat_round(pt[0]);
+          pt[1] = concat_round(pt[1]);
+          pt[2] = concat_round(pt[2]);
+          builder.addVertex(pt);
         }
-        auto geom_u = builder.build();
-        std::shared_ptr<const Geometry> geom_s(geom_u.release());
-        return ResultObject::mutableResult(geom_s);
+        if (ps->color_indices.size() > i && ps->color_indices[i] >= 0 &&
+            static_cast<size_t>(ps->color_indices[i]) < ps->colors.size())
+          builder.endPolygon(ps->colors[ps->color_indices[i]]);
+        else builder.endPolygon();
       }
     }
-    break;
+    if (!any) break;
+    auto geom_u = builder.build();
+    std::shared_ptr<const Geometry> geom_s(geom_u.release());
+    return ResultObject::mutableResult(geom_s);
   }
+
   case OpenSCADOperator::UNION: {
     const CsgOpNode *csgOpNode = dynamic_cast<const CsgOpNode *>(&node);
     Geometry::Geometries actualchildren;
@@ -1961,6 +2214,11 @@ std::unique_ptr<Polygon2d> GeometryEvaluator::applyToChildren2D(const AbstractNo
     auto r1 = ClipperUtils::applyOffset(*pol, offNode->delta, offNode->join_type, offNode->miter_limit,
                                         arc_tolerance);
     return r1;
+  }
+
+  const CsgOpNode *csgOpNode = dynamic_cast<const CsgOpNode *>(&node);
+  if (csgOpNode != nullptr && csgOpNode->r != 0 && pol) {
+    return addFillets2D(std::move(pol), children, csgOpNode->r, csgOpNode->fn);
   }
   return pol;
 }
@@ -2538,13 +2796,13 @@ static std::unique_ptr<Geometry> extrudePath(const PathExtrudeNode& node, const 
 
 #ifdef ENABLE_PYTHON
       if (node.twist_func != NULL) {
-        cur_twist = python_doublefunc(node.twist_func, length_os[i]);
+        cur_twist = python_doublefunc(node.twist_func, length_os[i % m]);
       } else
 #endif
-        cur_twist = node.twist * length_os[i];
+        cur_twist = node.twist * length_os[i % m];
 
-      double cur_scalex = 1.0 + (node.scale_x - 1.0) * length_os[i];
-      double cur_scaley = 1.0 + (node.scale_y - 1.0) * length_os[i];
+      double cur_scalex = 1.0 + (node.scale_x - 1.0) * length_os[i % m];
+      double cur_scaley = 1.0 + (node.scale_y - 1.0) * length_os[i % m];
       Outline2d profilemod;
 #ifdef ENABLE_PYTHON
       if (node.profile_func != NULL) {
@@ -2746,33 +3004,36 @@ Response GeometryEvaluator::visit(State& state, const RotateExtrudeNode& node)
 
 static int pullObject_calccut(const PullNode& node, Vector3d p1, Vector3d p2, Vector3d& r)
 {
-  Vector3d dir = p2 - p1;
-  Vector3d res;
-  Vector3d v1, v2;
-  Vector3d z(0, 0, 1);
-  v1 = node.dir.cross(dir);
-  if (v1.norm() < 0.001) {
-    v1 = Vector3d(dir[1], dir[2], dir[2]);
-    v1 = node.dir.cross(v1);
-  }
-  v2 = node.dir.cross(v1);
-  if (linsystem(dir, v1, v2, node.anchor - p1, res, nullptr)) return 1;
-
-  if (res[0] < 0 || res[0] > 1) return 1;
-  r = p1 + dir * res[0];
+  // Intersect edge p1→p2 with the plane through node.anchor with normal node.dir.
+  // The previous cross-product/linsystem formulation became singular precisely when
+  // the edge was parallel to node.dir (well-defined plane hits), and the fallback
+  // Vector3d(dir[1], dir[2], dir[2]) was zero for X-aligned edges — dropping faces.
+  // Callers only ask for straddling edges, so accept any finite t in [0,1]; a hard
+  // abs(denom) cutoff would still drop valid near-parallel crossings.
+  // Adjacent triangles traverse their shared edge in opposite directions. Use
+  // the same endpoint order so their cut vertices agree exactly, including for
+  // imported meshes with non-integral coordinates.
+  if ((p2 - p1).dot(node.dir) < 0) std::swap(p1, p2);
+  Vector3d edge = p2 - p1;
+  double denom = edge.dot(node.dir);
+  double t = (node.anchor - p1).dot(node.dir) / denom;
+  if (!std::isfinite(t) || t < 0.0 || t > 1.0) return 1;
+  r = p1 + edge * t;
   return 0;
 }
 static void pullObject_addtri(PolySetBuilder& builder, Vector3d a, Vector3d b, Vector3d c)
 {
   builder.beginPolygon(3);
-  builder.addVertex(c);
-  builder.addVertex(b);
   builder.addVertex(a);
+  builder.addVertex(b);
+  builder.addVertex(c);
 }
 
 static std::unique_ptr<PolySet> pullObject(const PullNode& node, const PolySet *ps)
 {
-  PolySetBuilder builder(0, 0, 3, true);
+  // Pulling can preserve cavities or introduce concavities. Declaring this convex
+  // makes backend conversion replace the surface with its convex hull.
+  PolySetBuilder builder(0, 0, 3, unknown);
   auto ps_tess = PolySetUtils::tessellate_faces(*ps);
   for (unsigned int i = 0; i < ps_tess->indices.size(); i++) {
     auto& pol = ps_tess->indices[i];
@@ -2784,7 +3045,7 @@ static std::unique_ptr<PolySet> pullObject(const PullNode& node, const PolySet *
 
     for (int j = 0; j < 3; j++) {
       Vector3d pt = ps_tess->vertices[pol[j]];
-      float dist = (pt - node.anchor).dot(node.dir);
+      double dist = (pt - node.anchor).dot(node.dir);
       if (dist > 0) {
         upper++;
         highind += j;
@@ -2841,7 +3102,7 @@ static std::unique_ptr<PolySet> pullObject(const PullNode& node, const PolySet *
     case 3:
       builder.beginPolygon(3);
       for (int j = 0; j < 3; j++) {
-        Vector3d pt = ps_tess->vertices[pol[2 - j]] + node.dir;
+        Vector3d pt = ps_tess->vertices[pol[j]] + node.dir;
         builder.addVertex(pt);
       }
       break;
@@ -2853,6 +3114,7 @@ static std::unique_ptr<PolySet> pullObject(const PullNode& node, const PolySet *
 
 Vector3d cross_pt(Vector3d p1, Vector3d p2, double x)
 {
+  if (p1[0] > p2[0]) std::swap(p1, p2);  // <-- immer gleiche Reihenfolge, unabhängig vom Aufrufer
   double f = (x - p1[0]) / (p2[0] - p1[0]);
   double y = p1[1] + (p2[1] - p1[1]) * f;
   double z = p1[2] + (p2[2] - p1[2]) * f;
@@ -2868,12 +3130,13 @@ std::vector<std::vector<IndexedColorTriangle>> wrapSlice(PolySetBuilder& builder
   std::vector<Vector3f> builder_vertices;
   std::vector<std::vector<IndexedColorTriangle>> results;  // nach strips sortiert
   int strips = xsteps.size() + 1;
+  int numSlices = strips - 2;  // Anzahl der tatsächlich auszugebenden Slices (= xsteps.size() - 1)
 
   // initialize
   Polygon dmy;
   std::vector<Polygon> dmyx;
   std::vector<IndexedColorTriangle> dmyz;
-  for (int i = 0; i < strips - 2; i++) {  // TODO check very carefully
+  for (int i = 0; i < numSlices; i++) {
     results.push_back(dmyz);
   }
 
@@ -2984,16 +3247,28 @@ std::vector<std::vector<IndexedColorTriangle>> wrapSlice(PolySetBuilder& builder
       if (cutnum == 0) {
         tmpresults[curlevel >> 1].push_back(chain);
       } else {
-        if (chain.size() > 1 && curpols < stripPolygons[curlevel >> 1].size()) {
-          stripPolygons[curlevel >> 1][curpols].insert(stripPolygons[curlevel >> 1][curpols].begin(),
-                                                       chain.begin(), chain.end() - 1);
+        if (chain.size() > 1) {
+          auto& bucket = stripPolygons[curlevel >> 1];
+          Vector3d chainEnd = chain[chain.size() - 1];
+          int match = -1;
+          for (size_t k = curpols; k < bucket.size(); k++) {
+            if (bucket[k].size() > 0 && (bucket[k][0] - chainEnd).norm() < 1e-3) {
+              match = k;
+              break;
+            }
+          }
+          if (match != -1) {
+            bucket[match].insert(bucket[match].begin(), chain.begin(), chain.end() - 1);
+          } else if (curpols < bucket.size()) {
+            // Fallback auf altes Verhalten, falls kein Match gefunden wird
+            bucket[curpols].insert(bucket[curpols].begin(), chain.begin(), chain.end() - 1);
+          }
         }
       }
     }
-    auto compare_func = [](const Vector3d& b, const Vector3d& a) {
-      if (b[2] > a[2]) return 1.0;
-      if (b[2] < a[2]) return -1.0;
-      return b[1] - a[1];
+    auto compare_func = [](const Vector3d& b, const Vector3d& a) -> bool {
+      if (b[2] != a[2]) return b[2] > a[2];
+      return b[1] > a[1];
     };
 
     for (int i = 0; i < strips; i++) {
@@ -3072,7 +3347,7 @@ std::vector<std::vector<IndexedColorTriangle>> wrapSlice(PolySetBuilder& builder
       // now output
     }
     // TODO strukturen nicht so tief, datem frueher verarbeiten
-    for (int i = 0; i < strips; i++) {
+    for (int i = 0; i < numSlices; i++) {
       // convert to indexed
 
       std::vector<IndexedFace> polys_ind;
@@ -3101,7 +3376,7 @@ std::vector<std::vector<IndexedColorTriangle>> wrapSlice(PolySetBuilder& builder
 
 static std::unique_ptr<PolySet> wrapObject(const WrapNode& node, const PolySet *ps)
 {
-  if (!Feature::ExperimentalWrapPolygon.is_enabled()) {
+  if (node.shape == nullptr) {  // use radius ideal approach
     PolySetBuilder builder(0, 0, 3, true);
     int segments1 = 360.0 / node.fa;
     int segments2 = 2 * G_PI * node.r / node.fs;
@@ -3163,8 +3438,13 @@ static std::unique_ptr<PolySet> wrapObject(const WrapNode& node, const PolySet *
           rad = node.r - pt[1];
           pt = Vector3d(rad * cos(ang), rad * sin(ang), pt[2]);
         }
+        //	builder.beginPolygon(curslice.size());
+        //        for (size_t j = 0; j < curslice.size() ; j++) {
+        //          builder.addVertex(curslice[j]);
+        //	}
+        //      builder.endPolygon();
         for (size_t j = 0; j < curslice.size() - 2; j++) {
-          builder.beginPolygon(curslice.size());
+          builder.beginPolygon(3);
           builder.addVertex(curslice[0]);
           builder.addVertex(curslice[j + 1]);
           builder.addVertex(curslice[j + 2]);
@@ -3200,48 +3480,29 @@ static std::unique_ptr<PolySet> wrapObject(const WrapNode& node, const PolySet *
   std::vector<double> xscale;
   VectorOfVector2d polygon;
   int polygonlen;
-  if (node.shape != nullptr) {
-    Tree tree(node.shape, "");
-    GeometryEvaluator geomevaluator(tree);
-    std::shared_ptr<const Geometry> geom = geomevaluator.evaluateGeometry(*tree.root(), true);
-    std::shared_ptr<const Polygon2d> pol = std::dynamic_pointer_cast<const Polygon2d>(geom);
-    if (pol != nullptr) {
-      auto outlines = pol->untransformedOutlines();
-      if (outlines.size() > 0) {
-        const Outline2d outl = outlines[0];
-        polygon = outl.vertices;
-      }
+  Tree tree(node.shape, "");
+  GeometryEvaluator geomevaluator(tree);
+  std::shared_ptr<const Geometry> geom = geomevaluator.evaluateGeometry(*tree.root(), true);
+  std::shared_ptr<const Polygon2d> pol = std::dynamic_pointer_cast<const Polygon2d>(geom);
+  if (pol != nullptr) {
+    auto outlines = pol->untransformedOutlines();
+    if (outlines.size() > 0) {
+      const Outline2d outl = outlines[0];
+      polygon = outl.vertices;
     }
-    if (polygon.size() == 0) return builder.build();
-    polygonlen = polygon.size();
-    double off = xmin;
-    int ind = 0;
-    xscale.push_back(off);
-    do {
-      auto& p1 = polygon[ind % polygonlen];
-      auto& p2 = polygon[(ind + 1) % polygonlen];
-      off += (p2 - p1).norm();
-      ind++;
-      xscale.push_back(off);
-    } while (off < xmax);
-  } else {  // r given
-    int segments1 = 360.0 / node.fa;
-    int segments2 = 2 * G_PI * node.r / node.fs;
-    int segments = segments1 > segments2 ? segments1 : segments2;
-    if (node.fn > 0) segments = node.fn;
-    double arclen = 2 * G_PI * node.r / segments;
-    //    if(xmin >= 0) xmin = ceil((xmin+1e-6)/arclen)*arclen;
-    //    else xmin = -floor((-xmin+1e-6)/arclen)*arclen;
-    do {
-      Vector2d pt(node.r * cos(xmin / node.r), node.r * sin(xmin / node.r));
-
-      xscale.push_back(xmin);
-      polygon.push_back(pt);
-      xmin += arclen;
-    } while (xmin <= xmax + 1e-6 + arclen);
-    polygonlen = polygon.size();
-    xscale.push_back(xmin);
   }
+  if (polygon.size() == 0) return builder.build();
+  polygonlen = polygon.size();
+  double off = xmin;
+  int ind = 0;
+  xscale.push_back(off);
+  do {
+    auto& p1 = polygon[ind % polygonlen];
+    auto& p2 = polygon[(ind + 1) % polygonlen];
+    off += (p2 - p1).norm();
+    ind++;
+    xscale.push_back(off);
+  } while (off < xmax);
 
   std::vector<indexedFaceList> polygons_sorted;
   std::vector<Vector4d> normals = calcTriangleNormals(ps->vertices, ps->indices);
@@ -3263,7 +3524,7 @@ static std::unique_ptr<PolySet> wrapObject(const WrapNode& node, const PolySet *
 
   std::vector<Vector3d> builder_vertices;
   builder.copyVertices(builder_vertices);  // TODO sehr ineffizient
-  int ind = 0;
+  ind = 0;
   for (const auto& slice : sliceresult) {
     double xbot = xscale[ind];
     double xtop = xscale[ind + 1];
@@ -3273,10 +3534,10 @@ static std::unique_ptr<PolySet> wrapObject(const WrapNode& node, const PolySet *
       for (int j = 0; j < 3; j++) {
         Vector3d pt = builder_vertices[poly[j]];
 
-        auto& p0 = polygon[ind > 1 ? ind - 1 : 0];
-        auto& p1 = polygon[ind];
-        auto& p2 = polygon[ind < polygonlen - 1 ? ind + 1 : polygonlen - 1];
-        auto& p3 = polygon[ind < polygonlen - 2 ? ind + 2 : polygonlen - 1];
+        auto& p0 = polygon[(ind + polygonlen - 1) % polygonlen];
+        auto& p1 = polygon[ind % polygonlen];
+        auto& p2 = polygon[(ind + 1) % polygonlen];
+        auto& p3 = polygon[(ind + 2) % polygonlen];
 
         Vector2d dir0 = (p1 - p0).normalized();
         Vector2d dir0n = Vector2d(-dir0[1], dir0[0]);
@@ -3288,8 +3549,19 @@ static std::unique_ptr<PolySet> wrapObject(const WrapNode& node, const PolySet *
         Vector2d dir2 = (p3 - p2).normalized();
         Vector2d dir2n = Vector2d(-dir2[1], dir2[0]);
 
-        Vector2d dirn = dir0n * (xtop - pt[0]) / (xtop - xbot) + dir2n * (pt[0] - xbot) / (xtop - xbot);
-        dirn = (dirn + dir1n).normalized();
+        double t = (pt[0] - xbot) / (xtop - xbot);       // 0..1 innerhalb des Segments
+        Vector2d bStart = (dir0n + dir1n).normalized();  // Grenze zum vorherigen Segment
+        Vector2d bEnd = (dir1n + dir2n).normalized();    // Grenze zum naechsten Segment
+
+        Vector2d dirn;
+        if (t < 0.5) {
+          double t2 = t * 2.0;
+          dirn = bStart * (1.0 - t2) + dir1n * t2;
+        } else {
+          double t2 = (t - 0.5) * 2.0;
+          dirn = dir1n * (1.0 - t2) + bEnd * t2;
+        }
+        dirn = dirn.normalized();
 
         Vector2d px =
           p1 + dir1u * (pt[0] - xscale[ind]) / (xscale[ind + 1] - xscale[ind]) + dirn * pt[1];
@@ -3331,8 +3603,7 @@ static std::unique_ptr<PolySet> debugObject(const DebugNode& node, const PolySet
   *psx = *ps;
 
   if (psx->color_indices.size() < psx->indices.size()) {
-    auto cs = ColorMap::instance().defaultColorScheme();
-    Color4f def_color = ColorMap::getColor(cs, RenderColor::OPENCSG_FACE_FRONT_COLOR);
+    Color4f def_color;
     int defind = psx->colors.size();
     psx->colors.push_back(def_color);
     while (psx->color_indices.size() < psx->indices.size()) {
@@ -3504,8 +3775,7 @@ Response GeometryEvaluator::visit(State& state, const WrapNode& node)
   std::shared_ptr<const Geometry> geom = applyToChildren3D(node, OpenSCADOperator::UNION).constptr();
   if (geom) {
     std::shared_ptr<const PolySet> ps = std::dynamic_pointer_cast<const PolySet>(geom);
-    if (ps != nullptr) {
-    } else ps = PolySetUtils::getGeometryAsPolySet(geom);
+    if (ps == nullptr) ps = PolySetUtils::getGeometryAsPolySet(geom);
     if (ps != nullptr) {
       std::unique_ptr<Geometry> ps_wrapped = wrapObject(node, ps.get());
       newgeom = std::move(ps_wrapped);
@@ -3560,7 +3830,7 @@ std::shared_ptr<Polygon2d> createDetailProjection(const std::shared_ptr<const Ge
   std::vector<Vector4d> normals, new_normals;
   std::vector<int> face_parents;
 
-  auto defcolor = *OpenSCAD::parse_color("#f9d72c");
+  Color4f defcolor;
   normals = calcTriangleNormals(ps->vertices, ps->indices);
   std::vector<IndexedColorFace> colorIndices;
   for (int i = 0; i < ps->indices.size(); i++) {

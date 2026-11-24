@@ -35,6 +35,7 @@
 #include "handle_dep.h"
 #include "src/geometry/PolySetBuilder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 
@@ -156,6 +157,9 @@ struct FilletEdgePair {
   int faceb = -1;
 };
 
+// Reject an edge collapse if it leaves an effectively zero-area face.
+constexpr double COLLAPSED_FACE_MIN_RELATIVE_AREA = 1e-12;
+
 bool validateFilletEdgePairs(const std::vector<IndexedFace>& indices, EdgeKey& failedEdge)
 {
   std::unordered_map<EdgeKey, FilletEdgePair, boost::hash<EdgeKey>> edge_db;
@@ -196,11 +200,47 @@ bool validateFilletEdgePairs(const std::vector<IndexedFace>& indices, EdgeKey& f
   return true;
 }
 
+bool validateCollapsedMesh(const std::vector<IndexedFace>& indices,
+                           const std::vector<Vector3d>& vertices,
+                           const std::vector<Vector4d>& referenceNormals)
+{
+  EdgeKey failedEdge;
+  if (!validateFilletEdgePairs(indices, failedEdge) || indices.size() != referenceNormals.size()) {
+    return false;
+  }
+
+  for (size_t faceIndex = 0; faceIndex < indices.size(); faceIndex++) {
+    const auto& face = indices[faceIndex];
+    if (face.size() < 3) return false;
+    for (size_t i = 0; i < face.size(); i++) {
+      for (size_t j = i + 1; j < face.size(); j++) {
+        if (face[i] == face[j]) return false;
+      }
+    }
+
+    Vector3d area = Vector3d::Zero();
+    double maxEdgeSquared = 0;
+    for (size_t i = 0; i < face.size(); i++) {
+      const Vector3d& current = vertices[face[i]];
+      const Vector3d& next = vertices[face[(i + 1) % face.size()]];
+      area += current.cross(next);
+      maxEdgeSquared = std::max(maxEdgeSquared, (next - current).squaredNorm());
+    }
+    if (!area.allFinite() || maxEdgeSquared == 0 ||
+        area.squaredNorm() <= maxEdgeSquared * maxEdgeSquared * COLLAPSED_FACE_MIN_RELATIVE_AREA *
+                                COLLAPSED_FACE_MIN_RELATIVE_AREA ||
+        area.dot(referenceNormals[faceIndex].head<3>()) <= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 std::unique_ptr<const Geometry> createFilletInt(std::shared_ptr<const PolySet> ps,
                                                 std::vector<bool> corner_selected, double r_, int bn,
-                                                double minang)
+                                                double minang, double min_edge_len)
 {
   double cos_minang = cos(minang * 3.1415 / 180.0);
   std::vector<Vector4d> normals, newnormals;
@@ -228,6 +268,17 @@ std::unique_ptr<const Geometry> createFilletInt(std::shared_ptr<const PolySet> p
   std::vector<intList> polinds, polposs;
 
   std::vector<std::vector<int>> corner_rounds;
+  // corner_rounds gets recomputed every iteration below, but welding
+  // decisions must only ever look at which vertices were 3-way junctions
+  // in the ORIGINAL, unwelded geometry -- otherwise a weld can make a
+  // previously-normal (2-edge) vertex look like a 3-way junction on the
+  // next iteration (because two chains now happen to meet there), which
+  // cascades into welding large stretches of otherwise-fine geometry.
+  // Vertex ids are stable across welds (we only ever remap ind2 -> ind1,
+  // never renumber survivors), so indexing this frozen snapshot by
+  // current ids remains valid on every iteration.
+  std::vector<std::vector<int>> corner_rounds_frozen;
+  bool corner_rounds_frozen_set = false;
   do {
     improved = false;  // fix short edges until happy
     std::vector<int> lockouts;
@@ -277,120 +328,176 @@ std::unique_ptr<const Geometry> createFilletInt(std::shared_ptr<const PolySet> p
         corner_rounds[e.first.ind2].push_back(e.first.ind1);
       }
     }
-    /* TODO activate
 
-        // eliminate  too short edges by extrapolating the neighboring edges
-        for(auto &e: edge_db) {
-          if(!e.second.sel) continue;
-          Vector3d line = vertices_copy[e.first.ind1] - vertices_copy[e.first.ind2];
-          if(line.norm() < 2*r_) {
+    if (!corner_rounds_frozen_set) {
+      corner_rounds_frozen = corner_rounds;
+      corner_rounds_frozen_set = true;
+    }
 
-            int a_prev=-1, a_next=-1;
-            int b_prev=-1, b_next=-1;
-
-            if(std::find(lockouts.begin(), lockouts.end(), e.first.ind1) != lockouts.end()) continue;
-            if(std::find(lockouts.begin(), lockouts.end(), e.first.ind2) != lockouts.end()) continue;
-            auto &facea = merged[e.second.facea];
-            int na=facea.size();
-            for(int i=0;i<na;i++) {
-              if(facea[i] == e.first.ind1){
-                a_prev = facea[(i+na-1)%na];
-                a_next = facea[(i+na+2)%na];
-              }
-            }
-
-            auto &faceb = merged[e.second.faceb];
-            int nb=faceb.size();
-            for(int i=0;i<nb;i++) {
-              if(faceb[i] == e.first.ind2){
-                b_prev = faceb[(i+nb-1)%nb];
-                b_next = faceb[(i+nb+2)%nb];
-              }
-            }
-
-            if(std::find(lockouts.begin(), lockouts.end(), a_prev) != lockouts.end()) continue;
-            if(std::find(lockouts.begin(), lockouts.end(), a_next) != lockouts.end()) continue;
-            if(std::find(lockouts.begin(), lockouts.end(), b_prev) != lockouts.end()) continue;
-            if(std::find(lockouts.begin(), lockouts.end(), b_next) != lockouts.end()) continue;
-
-            // is it safe to take the bigger face ?
-            int commonfaceind=-1, faceind1=-1, faceind2=-1;
-            EdgeKey ek1, ek2;
-            if(nb > na) {
-              commonfaceind=e.second.faceb; // TODO b hat die richtigen punkte
-              ek1 = EdgeKey(b_prev, e.first.ind2);
-              ek2 = EdgeKey(e.first.ind1, b_next);
-            } else { // na  > nb)
-              commonfaceind=e.second.facea; // TODO b hat die richtigen punkte
-              ek1 = EdgeKey(a_prev, e.first.ind1);
-              ek2 = EdgeKey(e.first.ind2, a_next);
-            }
-
-            if(edge_db.count(ek1)) {
-              auto &ev1 = edge_db.at(ek1);
-              if(ev1.facea == commonfaceind) faceind1= ev1.faceb;
-              if(ev1.faceb == commonfaceind) faceind1= ev1.facea;
-            }
-
-            // find opposite of e.first.ind1, b_next)
-            if(edge_db.count(ek2)) {
-              auto &ev2 = edge_db.at(ek2);
-              if(ev2.facea == commonfaceind) faceind2= ev2.faceb;
-              if(ev2.faceb == commonfaceind) faceind2= ev2.facea;
-            }
-
-            Vector3d fn1 =calcTriangleNormal(vertices_copy, merged[commonfaceind]).head<3>();
-            Vector3d fn2 =calcTriangleNormal(vertices_copy, merged[faceind1]).head<3>();
-            Vector3d fn3 =calcTriangleNormal(vertices_copy, merged[faceind2]).head<3>();
-
-            Vector3d fp1 = vertices_copy[merged[commonfaceind][0]];
-            Vector3d fp2 = vertices_copy[merged[faceind1][0]];
-            Vector3d fp3 = vertices_copy[merged[faceind2][0]];
-            Vector3d ptcut;
-            if(cut_face_face_face(fp1, fn1, fp2, fn2, fp3, fn3, ptcut,nullptr)) {
-              printf("Error during cutting\n");
-              e.second.sel=0;
-              continue;
-            }
-            //
-            // change is going to happen
-            vertices_copy[e.first.ind1]=ptcut;
-            lockouts.push_back(ek1.ind1);
-            lockouts.push_back(ek1.ind2);
-            lockouts.push_back(ek2.ind1);
-            lockouts.push_back(ek2.ind2);
-
-            for(int j=0;j<merged.size();j++) {
-              auto &tri = merged[j];
-              int n = tri.size();
-              int dupind=-1;
-              for(int i=0;i<n;i++)
-              {
-                if(tri[i] == e.first.ind2){
-                  tri[i] =e.first.ind1;
-                  if(tri[(i+1)%n] == e.first.ind1 || tri[(i+n-1)%n] == e.first.ind1) {
-                    dupind=i;
-                  }
-                }
-              }
-              if(dupind != -1) {
-                IndexedFace tri_new;
-                for(int i=0;i<dupind;i++) tri_new.push_back(tri[i]);
-                for(int i=dupind+1;i<n;i++) tri_new.push_back(tri[i]);
-                tri = tri_new;
-                n--;
-              }
-              if(n < 3) {
-                    merged.erase(merged.begin()+j);
-                    j--;
-              }
-            }
-            improved=true;
-          // TODO lockout
-          }
-
+    // Weld too-short selected fillet edges. A selected edge shorter than
+    // 2*r_ leaves no room for an unmodified fillet to fit -- that's what
+    // produced the self-intersecting spikes at 3-way corners. Collapse
+    // such edges directly on `merged`: wherever ind2 stood, use ind1
+    // instead, and drop the now-degenerate ind1-ind1 entries this
+    // creates. This works purely on `merged`/`vertices_copy`, never on
+    // edge_db (whose indices we're about to invalidate), and only looks
+    // at edges edge_db has already confirmed are sel==1 -- the same
+    // narrow scope the old, crashing plane-intersection code used.
+    {
+      std::vector<int> remap(vertices_copy.size());
+      for (size_t i = 0; i < remap.size(); i++) remap[i] = (int)i;
+      auto find_root = [&](int x) {
+        while (remap[x] != x) {
+          remap[x] = remap[remap[x]];
+          x = remap[x];
         }
-    */
+        return x;
+      };
+
+      bool any_weld = false;
+      for (auto& e : edge_db) {
+        if (!e.second.sel) continue;
+        // Only handle the exact transition case: one end of the short
+        // edge is a normal, fully-selected 2-edge corner (legitimately
+        // short by design -- fine curve tessellation, must NOT be
+        // touched), the other end is a genuine 3-way junction. Drop the
+        // 2-rounding vertex into the 3-rounding one. Edges where both
+        // ends are already 3-way (like the crossbar's own long edges) or
+        // both are normal 2-way corners are left alone entirely.
+        int s1 = (int)corner_rounds_frozen[e.first.ind1].size();
+        int s2 = (int)corner_rounds_frozen[e.first.ind2].size();
+        int keep, drop;
+        if (s1 == 3 && s2 == 2) {
+          keep = e.first.ind1;
+          drop = e.first.ind2;
+        } else if (s1 == 2 && s2 == 3) {
+          keep = e.first.ind2;
+          drop = e.first.ind1;
+        } else {
+          continue;
+        }
+        int rkeep = find_root(keep), rdrop = find_root(drop);
+        if (rkeep == rdrop) continue;
+        double len = (vertices_copy[rkeep] - vertices_copy[rdrop]).norm();
+        if (len > 2 * r_) continue;
+        remap[rdrop] = rkeep;  // delete the 2-rounding vertex into the 3-rounding one
+        any_weld = true;
+      }
+      if (any_weld) {
+        // Each face maps to at most one output face now (dropped
+        // entirely if welding collapsed it below 3 points, otherwise
+        // kept as-is) -- no more splitting, so a single old-index ->
+        // new-index map is enough to keep faceParents in lockstep.
+        std::vector<IndexedFace> cleaned_faces;
+        std::unordered_map<int, int> old_to_new;
+        cleaned_faces.reserve(merged.size());
+        for (size_t old_i = 0; old_i < merged.size(); old_i++) {
+          IndexedFace remapped = merged[old_i];
+          for (auto& v : remapped) v = find_root(v);
+          IndexedFace cleaned;
+          for (int v : remapped) {
+            if (cleaned.empty() || cleaned.back() != v) cleaned.push_back(v);
+          }
+          while (cleaned.size() > 1 && cleaned.front() == cleaned.back()) cleaned.pop_back();
+          if (cleaned.size() < 3) continue;  // welded away entirely
+          old_to_new[(int)old_i] = (int)cleaned_faces.size();
+          cleaned_faces.push_back(std::move(cleaned));
+        }
+        // faceParents is index-parallel to merged and marks hole faces
+        // (faceParents[i] != -1 -> face i is a hole, value = its parent's
+        // index). merged just got rebuilt/reordered, so this has to be
+        // rebuilt in lockstep or every hole/parent lookup downstream
+        // (including the fanf/fbnf "is this edge part of a hole" checks)
+        // silently points at the wrong face.
+        std::vector<int> new_faceParents(cleaned_faces.size(), -1);
+        for (auto& [old_i, new_i] : old_to_new) {
+          int old_parent = faceParents[old_i];
+          if (old_parent < 0) continue;
+          auto it = old_to_new.find(old_parent);
+          new_faceParents[new_i] = (it != old_to_new.end()) ? it->second : -1;
+        }
+        merged = std::move(cleaned_faces);
+        faceParents = std::move(new_faceParents);
+        // newnormals is likewise index-parallel to merged (used later as
+        // the exact normal tessellatePolygonWithHoles projects into) and
+        // has exactly the same "goes stale the moment merged is rebuilt"
+        // problem faceParents had. Recompute it fresh from the new
+        // merged/vertices_copy rather than trying to carry old entries
+        // forward -- same approach the pre-existing sliver-collapse code
+        // below already uses after its own merged-editing.
+        newnormals = calcTriangleNormals(vertices_copy, merged);
+        improved = true;
+        continue;  // re-derive polinds/edge_db/corner_rounds from scratch
+      }
+    }
+    // Boolean operations with a tiny overlap can leave sliver edges around the
+    // seam. Collapse those before constructing fillet patches.
+    if (min_edge_len > 0) {
+      auto candidate = edge_db.end();
+      for (auto edge = edge_db.begin(); edge != edge_db.end(); ++edge) {
+        const int ind1 = edge->first.ind1;
+        const int ind2 = edge->first.ind2;
+        const double edge_len = (vertices_copy[ind1] - vertices_copy[ind2]).norm();
+        if (edge_len >= min_edge_len) continue;
+        if (candidate == edge_db.end() || ind1 < candidate->first.ind1 ||
+            (ind1 == candidate->first.ind1 && ind2 < candidate->first.ind2)) {
+          candidate = edge;
+        }
+      }
+
+      if (candidate != edge_db.end()) {
+        const auto vertices_before_collapse = vertices_copy;
+        const auto merged_before_collapse = merged;
+        const auto face_parents_before_collapse = faceParents;
+        const auto normals_before_collapse = newnormals;
+        const auto selected_before_collapse = corner_selected;
+        auto& e = *candidate;
+        int keep = e.first.ind1;
+        int drop = e.first.ind2;
+
+        const bool keep_selected =
+          keep < static_cast<int>(corner_selected.size()) && corner_selected[keep];
+        const bool drop_selected =
+          drop < static_cast<int>(corner_selected.size()) && corner_selected[drop];
+        if (!keep_selected && drop_selected) std::swap(keep, drop);
+        if (keep_selected && drop_selected) {
+          vertices_copy[keep] = 0.5 * (vertices_copy[keep] + vertices_copy[drop]);
+        }
+        if (drop < static_cast<int>(corner_selected.size())) corner_selected[drop] = false;
+
+        for (size_t face_index = 0; face_index < merged.size(); face_index++) {
+          auto& face = merged[face_index];
+          const int size = static_cast<int>(face.size());
+          int duplicate = -1;
+          for (int i = 0; i < size; i++) {
+            if (face[i] != drop) continue;
+            face[i] = keep;
+            if (face[(i + 1) % size] == keep || face[(i + size - 1) % size] == keep) duplicate = i;
+          }
+          if (duplicate != -1) face.erase(face.begin() + duplicate);
+          if (face.size() >= 3) continue;
+
+          merged.erase(merged.begin() + static_cast<long>(face_index));
+          faceParents.erase(faceParents.begin() + static_cast<long>(face_index));
+          newnormals.erase(newnormals.begin() + static_cast<long>(face_index));
+          for (int& parent : faceParents) {
+            if (parent == static_cast<int>(face_index)) parent = -1;
+            else if (parent > static_cast<int>(face_index)) parent--;
+          }
+          face_index--;
+        }
+        if (validateCollapsedMesh(merged, vertices_copy, newnormals)) {
+          newnormals = calcTriangleNormals(vertices_copy, merged);
+          improved = true;
+        } else {
+          vertices_copy = vertices_before_collapse;
+          merged = merged_before_collapse;
+          faceParents = face_parents_before_collapse;
+          newnormals = normals_before_collapse;
+          corner_selected = selected_before_collapse;
+        }
+      }
+    }
   } while (improved == true);
 
   // start builder with existing vertices to have VertexIndex available
@@ -642,10 +749,14 @@ std::unique_ptr<const Geometry> createFilletInt(std::shared_ptr<const PolySet> p
   for (size_t i = 0; i < newfaces.size(); i++) {
     // tessellate first with holes // search all holes
     if (faceParents[i] != -1) continue;
+    if (newfaces[i].size() < 3) continue;
     std::vector<IndexedFace> faces;
     faces.push_back(newfaces[i]);
-    for (size_t j = 0; j < newfaces.size(); j++)
-      if ((size_t)faceParents[j] == i) faces.push_back(newfaces[j]);
+    for (size_t j = 0; j < newfaces.size(); j++) {
+      if ((size_t)faceParents[j] != i) continue;
+      if (newfaces[j].size() < 3) continue;  // degenerate hole: skip, don't break indexing
+      faces.push_back(newfaces[j]);
+    }
     //    if(faces.size() >1 ) continue;
     std::vector<IndexedTriangle> triangles;
     Vector3f norm(newnormals[i][0], newnormals[i][1], newnormals[i][2]);
@@ -818,5 +929,5 @@ std::unique_ptr<const Geometry> FilletNode::createGeometry() const
   } else {
     for (size_t i = 0; i < ps_merged->vertices.size(); i++) corner_selected.push_back(true);
   }
-  return createFilletInt(ps_merged, corner_selected, this->r, this->fn, this->minang);
+  return createFilletInt(ps_merged, corner_selected, this->r, this->fn, this->minang, 0);
 }

@@ -1,5 +1,22 @@
 # I/O and Integration
 
+## Choosing an import function
+
+PythonSCAD has several ways to pull in external content. They are **not**
+interchangeable — pick by what you are loading:
+
+| Goal | Function | Returns |
+|------|----------|---------|
+| Local mesh / 2D drawing (STL, 3MF, SVG, …) | [`osimport`](#osimport) | Geometry object (or color→object dict for SVG `split_by_color`) |
+| Local OpenSCAD library (`.scad` modules/functions/vars) | [`osuse`](#osuse) (prefer over deprecated [`osinclude`](#osinclude)) | Handle with attributes for modules, functions, and variables |
+| Shared **Python** library (versioned package) | Ordinary `import` after `pip install` — see [Libraries](../libraries/index.md) | Whatever that module exports |
+| Local Python / PythonSCAD script | Ordinary Python `import` / `from … import …` | Whatever that module exports |
+| Remote single-file `.py` over HTTP(S) | Deprecated [`nimport`](#nimport) (GUI only) | `None` — side effect is `from <module> import *` into the current namespace |
+
+Inline OpenSCAD snippets (not a file) use [`scad`](#scad).
+
+---
+
 ## osimport
 
 Import geometry from a file. This is the PythonSCAD equivalent of OpenSCAD's `import()` (renamed because `import` is a Python keyword).
@@ -32,7 +49,13 @@ Import geometry from a file. This is the PythonSCAD equivalent of OpenSCAD's `im
 | `fn`, `fa`, `fs` | float | global | Curve discretization; defaults to the global `fn`/`fa`/`fs` values |
 | `split_by_color` | bool | `False` | SVG only: return `{hex_color: 2D object}` instead of one merged object; raises `ValueError` for non-SVG input or when no colors match the SVG selection. |
 
-**Supported formats:** STL, OFF, AMF, 3MF (3D); DXF, SVG (2D)
+**Supported formats** (by file extension):
+
+- **3D:** STL, OFF, OBJ, 3MF, STEP / STP; NEF3 when the build includes CGAL
+- **2D:** DXF, SVG; CDR when the build includes optional CDR support (`ENABLE_CDR`)
+
+`osimport` does **not** load `.scad` or `.py` files — use [`osuse`](#osuse) or
+Python's `import` for those.
 
 **Examples:**
 
@@ -67,6 +90,10 @@ ready to assign to different tool heads in a slicer:
     export(solids, "watermelon.3mf")
     ```
 
+When previewing same-height extrusions with
+[`MultiToolExporter`](multitool.md#preview-artifacts), use
+`exporter.show(render=True)` to avoid F5 coplanar-face artifacts.
+
 **OpenSCAD reference:** [import](https://en.wikibooks.org/wiki/OpenSCAD_User_Manual/Importing_Geometry#import)
 
 ---
@@ -95,6 +122,10 @@ analog of OpenSCAD's `use <file.scad>`, with two semantic differences:
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `file` | string | Path to the `.scad` file |
+
+Relative paths are resolved against the script directory first; if not found
+there, PythonSCAD falls back to the configured OpenSCAD library path (the same
+search used by OpenSCAD's `use` / `include`).
 
 **Returns:** an object exposing the imported library's contents:
 
@@ -236,29 +267,48 @@ Execute inline OpenSCAD code from within a Python script.
 
 ## nimport
 
-Import a model from a network URL. This function is only available in GUI mode.
+!!! warning "Deprecated"
+    `nimport` is **deprecated**. Do not use it in new designs. Calling it logs a
+    deprecation message to the PythonSCAD console and points at
+    [Sharing and using libraries](../libraries/index.md). Prefer a published
+    Python package (`pip install` + ordinary `import`).
+
+    Reasons to stop using it:
+
+    - **Misleading name** — unlike [`osimport`](#osimport), it does not load
+      STL/3MF/SVG geometry; it only fetches a single remote `.py` file.
+    - **Single file only** — multi-file libraries and proper packages cannot be
+      expressed as one URL download.
+    - **Fragile URLs** — if the host rearranges paths or goes offline, every
+      design that depended on that URL breaks.
+    - **No versions** — the remote file can change incompatibly with no pin.
+    - **Security** — if the domain expires and is taken over, or the host is
+      compromised, the downloaded script can be replaced with malware. There is
+      no package integrity or release attestation comparable to PyPI.
+
+    The Preferences → Python **Network Import List** and new-tab `nimport("…")`
+    prefills have been **removed**. Existing scripts that still call `nimport`
+    continue to run until the function is removed in a future release.
+
+Legacy behavior (GUI builds only; omitted from headless / `OPENSCAD_NOGUI`):
+download a `.py` file from `url` into the user library directory, then run
+`from <stem> import *`. Returns `None`. This is **not** a geometry importer —
+use [`osimport`](#osimport) for mesh/drawing files.
 
 **Syntax:**
 
 === "Python"
 
     ```python
-    nimport(url)
+    nimport(url)  # deprecated
     ```
 
 **Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `url` | string | URL of the model to download and import |
+| `url` | string | HTTP(S) URL of a `.py` module to download and star-import |
 
-**Examples:**
-
-=== "Python"
-
-    ```python
-    from pythonscad import *
-
-    model = nimport("https://example.com/model.stl")
-    model.show()
-    ```
+**Migration:** publish or install a package instead — see
+[Libraries](../libraries/index.md), [Creating](../libraries/creating.md), and
+[Using](../libraries/using.md).

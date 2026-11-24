@@ -58,23 +58,39 @@ rs_repo_default() {
   gh repo view --json nameWithOwner --jq .nameWithOwner
 }
 
+rs_expected_commit() {
+  local commit=${1:-${RELEASE_SMOKE_COMMIT:-}}
+  if [[ -z "$commit" ]]; then
+    commit=$(git -C "$(dirname "${BASH_SOURCE[0]}")/../.." rev-parse HEAD)
+  fi
+  [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || rs_die "expected a full 40-character source commit SHA"
+  printf '%s\n' "$commit"
+}
+
+rs_validate_run_commit() {
+  local repo=$1 run_id=$2 commit=$3
+  local actual
+  actual=$(gh run view "$run_id" --repo "$repo" --json headSha --jq .headSha)
+  [[ "$actual" == "$commit" ]] || rs_die "run $run_id was built from $actual, expected $commit"
+}
+
 rs_latest_successful_run() {
   local repo=$1
   local workflow=$2
   local ref=${3:-}
+  local commit
+  commit=$(rs_expected_commit "${4:-}")
   local args=(run list --repo "$repo" --workflow "$workflow" --status success
-    --json 'databaseId,headBranch')
+    --commit "$commit" --limit 1 --json databaseId --jq '.[0].databaseId // ""')
   if [[ -n "$ref" ]]; then
-    case "$ref" in
-      *\"*|*\\*|*$'\n'*|*$'\r'*)
-        rs_die "--ref contains characters that cannot be used in GitHub Actions jq filters"
-        ;;
-    esac
-    args+=(--limit 50 --jq "map(select(.headBranch == \"$ref\")) | .[0].databaseId // \"\"")
-  else
-    args+=(--limit 1 --jq '.[0].databaseId')
+    args+=(--branch "$ref")
   fi
-  gh "${args[@]}"
+  local run_id
+  run_id=$(gh "${args[@]}")
+  [[ -n "$run_id" && "$run_id" != "null" ]] ||
+    rs_die "no successful $workflow build for commit $commit (ref '$ref'); trigger fresh release builds"
+  rs_validate_run_commit "$repo" "$run_id" "$commit"
+  printf '%s\n' "$run_id"
 }
 
 rs_download_run_artifact() {
@@ -130,6 +146,25 @@ PY
 from pythonscad import *
 
 export(cube(10), "ipython-cube.stl")
+PY
+  cat > "$testdir/pyqt6-smoke.py" <<'PY'
+from PyQt6 import QtCore, QtWidgets, sip
+from pythonscad import qapp_ptr
+
+# --repl never starts the GUI, so qapp_ptr() is 0. wrapinstance(0) raises
+# and repl() still exits 0, which used to look like a silent packaging miss.
+# Importing the bundled bindings is the packaging check; wrap the C++ app
+# only when one actually exists.
+ptr = qapp_ptr()
+if ptr:
+    app = sip.wrapinstance(ptr, QtWidgets.QApplication)
+    assert app is not None
+
+marker = "PYQT6_PACKAGED_OK " + QtCore.QT_VERSION_STR
+print(marker, flush=True)
+with open("pyqt6-ok.txt", "w", encoding="utf-8") as fh:
+    fh.write(marker + "\n")
+raise SystemExit(0)
 PY
 }
 
@@ -197,6 +232,8 @@ rs_smoke_binary() {
   local exe=$1
   local label=$2
   local workdir=$3
+  local expect_pyqt6=${4:-0}
+  local startup_option=${5:---info}
 
   [[ -x "$exe" ]] || rs_die "executable is not runnable: $exe"
 
@@ -204,7 +241,7 @@ rs_smoke_binary() {
   rs_write_common_test_inputs "$testdir"
 
   rs_log "Smoke testing $label: startup"
-  rs_run_logged "$label: startup" "$testdir/info.log" "$exe" --info
+  rs_run_logged "$label: startup" "$testdir/info.log" "$exe" "$startup_option"
 
   rs_log "Smoke testing $label: OpenSCAD .scad export"
   rs_run_logged "$label: OpenSCAD .scad export" "$testdir/scad-export.log" \
@@ -221,10 +258,57 @@ rs_smoke_binary() {
     "$testdir/repl-smoke.py" "$exe" --repl
   rs_file_nonempty "$testdir/repl-cube.stl" "$label: basic Python REPL"
 
+  # Standalone pythonscad-python runner must register the embedded _openscad
+  # module (issue #1031). Prefer a sibling shim; for AppImages extract once.
+  local python_shim=""
+  local shim_env=()
+  local exe_dir
+  exe_dir=$(dirname -- "$exe")
+  if [[ -x "$exe_dir/pythonscad-python" ]]; then
+    python_shim="$exe_dir/pythonscad-python"
+  elif [[ "$exe" == *.AppImage || "$exe" == *.appimage ]]; then
+    local extract_dir="$testdir/appimage-extract"
+    local squashfs="$extract_dir/squashfs-root"
+    rs_log "Smoke testing $label: extracting AppImage for pythonscad-python"
+    mkdir -p "$extract_dir"
+    rs_run_logged "$label: appimage extract" "$testdir/appimage-extract.log" \
+      bash -c 'cd "$1" && "$2" --appimage-extract' bash "$extract_dir" "$exe"
+    if [[ -x "$squashfs/usr/bin/pythonscad-python" ]]; then
+      python_shim="$squashfs/usr/bin/pythonscad-python"
+      # Match AppRun's library / Python env so the extracted shim can load.
+      shim_env=(
+        "LD_LIBRARY_PATH=$squashfs/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        "PYTHONHOME=$squashfs/usr"
+        "PYTHONPATH=$squashfs/usr/share/pythonscad/libraries/python${PYTHONPATH:+:$PYTHONPATH}"
+      )
+    fi
+  fi
+  if [[ -n "$python_shim" ]]; then
+    rs_log "Smoke testing $label: pythonscad-python import"
+    cat > "$testdir/shim-import.py" <<'PY'
+from pythonscad import *
+export(cube(10), "shim-cube.stl")
+PY
+    rs_run_logged_in_dir "$label: pythonscad-python import" "$testdir" \
+      "$testdir/shim-import.log" "" env "${shim_env[@]}" "$python_shim" "shim-import.py"
+    rs_file_nonempty "$testdir/shim-cube.stl" "$label: pythonscad-python import"
+  fi
+
   rs_log "Smoke testing $label: IPython"
   rs_run_logged_in_dir "$label: IPython" "$testdir" "$testdir/ipython.log" "" \
     "$exe" --ipython ipython-smoke.py
   rs_file_nonempty "$testdir/ipython-cube.stl" "$label: IPython"
+
+  if [[ "$expect_pyqt6" == "1" ]]; then
+    rs_log "Smoke testing $label: packaged PyQt6"
+    rm -f "$testdir/pyqt6-ok.txt"
+    rs_run_logged_in_dir "$label: packaged PyQt6" "$testdir" "$testdir/pyqt6.log" \
+      "$testdir/pyqt6-smoke.py" "$exe" --repl
+    if [[ ! -s "$testdir/pyqt6-ok.txt" ]]; then
+      rs_print_log_excerpt "$testdir/pyqt6.log"
+      rs_die "$label: packaged PyQt6 did not emit its success marker"
+    fi
+  fi
 
   rs_log "Smoke testing $label: OK"
 }

@@ -14,7 +14,8 @@ Download, mount, and smoke test the latest macOS DMG artifact.
 
 Options:
   --repo <owner/name>       GitHub repository to query. Defaults to current repo.
-  --ref <branch-or-tag>     Branch used for latest-run filtering.
+  --ref <branch-or-tag>     Branch used for run filtering.
+  --commit <sha>            Required source SHA (default: checkout HEAD).
   --run-id <id>             Use a specific build-macos-release.yml run.
   --workdir <path>          Working directory. Defaults to a temp directory.
   --keep-workdir            Keep temporary files after the run.
@@ -26,18 +27,25 @@ EOF
 
 repo=""
 ref=""
+commit=""
 run_id=""
 workdir_arg=""
 keep_workdir=0
 skip_download=0
 artifact_dir=""
 mountpoint=""
+gui_pid=""
 
 while (($#)); do
   case "$1" in
     --repo)
       repo=${2:-}
       [[ -n "$repo" ]] || rs_die "--repo requires a value"
+      shift 2
+      ;;
+    --commit)
+      commit=${2:-}
+      [[ -n "$commit" ]] || rs_die "--commit requires a value"
       shift 2
       ;;
     --ref)
@@ -82,8 +90,26 @@ rs_require_command find
 rs_require_command hdiutil
 
 workdir=$(rs_make_workdir "$workdir_arg")
+stop_gui() {
+  local pid=${1:-}
+  [[ -n "$pid" ]] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in 1 2 3; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   local status=$?
+  if [[ -n "$gui_pid" ]]; then
+    stop_gui "$gui_pid"
+    gui_pid=""
+  fi
   if [[ -n "$mountpoint" && -d "$mountpoint" ]]; then
     hdiutil detach "$mountpoint" >/dev/null 2>&1 || true
   fi
@@ -98,14 +124,16 @@ fi
 
 if [[ "$skip_download" == "0" ]]; then
   rs_require_command gh
+  commit=$(rs_expected_commit "$commit")
   if [[ -z "$repo" ]]; then
     repo=$(rs_repo_default)
   fi
 
   if [[ -z "$run_id" ]]; then
-    run_id=$(rs_latest_successful_run "$repo" build-macos-release.yml "$ref")
+    run_id=$(rs_latest_successful_run "$repo" build-macos-release.yml "$ref" "$commit")
     [[ -n "$run_id" && "$run_id" != "null" ]] || rs_die "no successful build-macos-release.yml run found"
   fi
+  rs_validate_run_commit "$repo" "$run_id" "$commit"
   rs_log "Downloading macOS DMG artifact from run $run_id"
   rs_download_run_artifact "$repo" "$run_id" 'PythonSCAD-*' "$artifact_dir"
 else
@@ -154,6 +182,34 @@ else
 fi
 
 [[ -n "$exe" ]] || rs_die "could not locate PythonSCAD executable inside $app"
-rs_smoke_binary "$exe" "$(basename "$app")" "$workdir"
+rs_smoke_binary "$exe" "$(basename "$app")" "$workdir" 1
+
+gui_log="$workdir/gui-startup.log"
+gui_home="$workdir/gui-home"
+mkdir -p "$gui_home"
+rs_log "Smoke testing $(basename "$app"): native GUI startup"
+
+set +e
+(
+  cd "$workdir"
+  exec env -u QT_QPA_PLATFORM HOME="$gui_home" "$exe" > "$gui_log" 2>&1 </dev/null
+) &
+gui_pid=$!
+set -e
+
+for _ in {1..10}; do
+  if ! kill -0 "$gui_pid" 2>/dev/null; then
+    set +e
+    wait "$gui_pid"
+    gui_status=$?
+    set -e
+    rs_print_log_excerpt "$gui_log"
+    rs_die "native GUI exited during startup with status $gui_status"
+  fi
+  sleep 1
+done
+
+stop_gui "$gui_pid"
+gui_pid=""
 
 rs_log "macOS DMG smoke tests passed"

@@ -60,12 +60,6 @@
         "xvfb"
       ],
       "version_overrides": {
-        "11": {
-          "add": [],
-          "remove": [
-            "libmimalloc-dev"
-          ]
-        },
         "12": {
           "add": [],
           "remove": []
@@ -369,7 +363,6 @@
         "gtk-doc",
         "harfbuzz",
         "hidapi",
-        "imagemagick",
         "lib3mf",
         "libffi",
         "libxml2",
@@ -378,7 +371,6 @@
         "mpfr",
         "nettle",
         "ninja",
-        "node",
         "opencsg",
         "pkg-config",
         "python@3.12",

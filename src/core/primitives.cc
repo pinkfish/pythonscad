@@ -72,40 +72,6 @@ static void generate_circle(InsertIterator iter, double r, double z, double angl
   }
 }
 
-/**
- * Return a radius value by looking up both a diameter and radius variable.
- * The diameter has higher priority, so if found an additionally set radius
- * value is ignored.
- *
- * @param parameters parameters with variable values.
- * @param inst containing instantiation.
- * @param radius_var name of the variable to lookup for the radius value.
- * @param diameter_var name of the variable to lookup for the diameter value.
- * @return radius value of type Value::Type::NUMBER or Value::Type::UNDEFINED if both
- *         variables are invalid or not set.
- */
-static Value lookup_radius(const Parameters& parameters,
-                           const std::shared_ptr<const ModuleInstantiation>& inst,
-                           const std::string& diameter_var, const std::string& radius_var)
-{
-  const auto& d = parameters[diameter_var];
-  const auto& r = parameters[radius_var];
-  const auto r_defined = (r.type() == Value::Type::NUMBER);
-
-  if (d.type() == Value::Type::NUMBER) {
-    if (r_defined) {
-      LOG(message_group::Warning, inst->location(), parameters.documentRoot(),
-          "Ignoring radius variable %1$s as diameter %2$s is defined too.", quoteVar(radius_var),
-          quoteVar(diameter_var));
-    }
-    return d.toDouble() / 2.0;
-  } else if (r_defined) {
-    return r.clone();
-  } else {
-    return Value::undefined.clone();
-  }
-}
-
 std::unique_ptr<const Geometry> CubeNode::createGeometry() const
 {
   if (this->dim[0] <= 0 || !std::isfinite(this->dim[0]) || this->dim[1] <= 0 ||
@@ -148,34 +114,105 @@ std::unique_ptr<const Geometry> CubeNode::createGeometry() const
   return ps;
 }
 
-std::shared_ptr<const Geometry> CubeNode::dragPoint(const Vector3d& pt, const Vector3d& newpt,
-                                                    DragResult& result)
+void CubeNode::dragBegin()
 {
-  if (dim_[0] == 0) {
-    dim_[0] = dim[0];
-    dim_[1] = dim[1];
-    dim_[2] = dim[2];
-  }
-  if (dragflags) {
-    result.modname = "cube";
-    result.mods.clear();
-  }
+  for (int i = 0; i < 3; i++) dim_[i] = dim[i];
+}
+
+namespace {
+constexpr double DRAG_TOL = 1e-3;    // vertex hit tolerance
+constexpr double DRAG_MIN = 1e-2;    // smallest size/height after a drag
+constexpr double DRAG_SNAP = 0.1;    // grid for lengths
+constexpr double DRAG_SNAP_ANG = 1;  // grid for angles in degrees
+
+DragMod makeDragMod(const std::string& name, int index, std::vector<int> arrinfo, double value)
+{
+  DragMod mod;
+  mod.name = name;
+  mod.index = index;
+  mod.arrinfo = std::move(arrinfo);
+  mod.value = value;
+  return mod;
+}
+
+// face interval of a cube axis: center 1 -> [0,d], 0 -> [-d/2,d/2], -1 -> [-d,0]
+void cubeAxisRange(int center, double d, double& lo, double& hi)
+{
+  lo = (center > 0) ? 0 : (center < 0 ? -d : -d / 2);
+  hi = (center > 0) ? d : (center < 0 ? 0 : d / 2);
+}
+}  // namespace
+
+std::shared_ptr<const Geometry> CubeNode::dragPoint(const Vector3d& pt, const Vector3d& newpt,
+                                                    const Vector3d& dir, DragResult& result)
+{
+  // Fallback if dragBegin() was not called (e.g. external callers).
+  if (dim_[0] == 0) dragBegin();
+  if (!dragflags) return createGeometry();
+
+  // The picked point must be a corner of *this* cube (in pre-drag size),
+  // otherwise another object was hit and we must not touch the result.
+  bool on_hi[3];
   for (int i = 0; i < 3; i++) {
-    if (dragflags & (1 << i)) {
-      if (center[i] == 1 && fabs(pt[i] - dim_[i]) < 1e-3) {
-        this->dim[i] = newpt[i];
-        DragMod mod;
-        mod.index = 0;
-        mod.name = "size";
-        mod.arrinfo.push_back(i);
-        mod.value = newpt[i];
-        result.mods.push_back(mod);
-      }
-    }
-    if (dragflags & (1 << i) && pt[i] != 0) result.anchor[i] = newpt[i];
-    else result.anchor[i] = pt[i];
+    double lo, hi;
+    cubeAxisRange(center[i], dim_[i], lo, hi);
+    const bool at_lo = fabs(pt[i] - lo) < DRAG_TOL, at_hi = fabs(pt[i] - hi) < DRAG_TOL;
+    if (!at_lo && !at_hi) return createGeometry();
+    on_hi[i] = at_hi;
   }
-  return std::shared_ptr<const Geometry>(std::move(createGeometry()));
+
+  // Axes which can change: marked and the picked corner not on the fixed face
+  // (e.g. the origin face of center=1). The corner moves only along those axes,
+  // so follow the mouse ray on that line / plane instead of the screen plane.
+  int mask = 0;
+  for (int i = 0; i < 3; i++) {
+    const bool movable = center[i] == 0 || (center[i] > 0) == on_hi[i];
+    if (movable && (dragflags & ((1 << i) | 8))) mask |= 1 << i;
+  }
+  const Vector3d target = (dragflags & 8) ? newpt : dragConstrain(pt, newpt, dir, mask);
+
+  // Size each axis would get from the mouse position, NAN if it cannot change.
+  double cand[3];
+  for (int i = 0; i < 3; i++) {
+    cand[i] = NAN;
+    if (!(mask & (1 << i))) continue;
+    if (center[i] > 0) cand[i] = target[i];
+    else if (center[i] < 0) cand[i] = -target[i];
+    else cand[i] = 2 * fabs(target[i]);
+  }
+
+  std::vector<DragMod> mods;
+  if (dragflags & 8) {
+    // cube(marked(10)): one value for all edges, follow the axis moved most
+    int best = -1;
+    for (int i = 0; i < 3; i++) {
+      if (std::isnan(cand[i])) continue;
+      if (best < 0 || fabs(cand[i] - dim_[i]) > fabs(cand[best] - dim_[best])) best = i;
+    }
+    if (best < 0) return createGeometry();
+    const double s = std::max(dragSnap(cand[best], DRAG_SNAP), DRAG_MIN);
+    for (int i = 0; i < 3; i++) dim[i] = s;
+    mods.push_back(makeDragMod("size", 0, {}, s));
+  } else {
+    for (int i = 0; i < 3; i++) {
+      if (!(dragflags & (1 << i)) || std::isnan(cand[i])) continue;
+      dim[i] = std::max(dragSnap(cand[i], DRAG_SNAP), DRAG_MIN);
+      mods.push_back(makeDragMod("size", 0, {i}, dim[i]));
+    }
+  }
+  if (mods.empty()) return createGeometry();
+
+  Vector3d anchor;
+  for (int i = 0; i < 3; i++) {
+    double lo, hi;
+    cubeAxisRange(center[i], dim[i], lo, hi);
+    anchor[i] = on_hi[i] ? hi : lo;
+  }
+  result.modname = "cube";
+  result.line = py_line;
+  result.mods = mods;
+  result.anchor = anchor;
+  return createGeometry();
 }
 
 static std::shared_ptr<AbstractNode> builtin_cube(const std::shared_ptr<const ModuleInstantiation>& inst,
@@ -218,27 +255,197 @@ std::string SphereNode::toString() const
   std::ostringstream stream;
   stream << "sphere(" << discretizer;
 #ifdef ENABLE_PYTHON
-  if (r_func != nullptr) stream << ", r_func = " << rand();
+  if (r_func != nullptr) stream << ", r_func = " << this->func_hash;
   else
 #endif
-    stream << ", r = " << r;
+    stream << ", r = " << r << ", style = \"" << style << "\"";
   stream << ")";
   return stream.str();
 }
 
-std::unique_ptr<const Geometry> SphereNode::createGeometry() const
+/*
+ * Octahedral sphere tessellation (style = "octa").
+ *
+ * Start from an octahedron whose six vertices are on the axis poles and
+ * subdivide each of its eight triangular faces into n*n triangles, with
+ * n = ceil(fragments / 4). Each of the three great circles in the coordinate
+ * planes then is a regular polygon with 4*n segments whose vertices are
+ * exactly those of circle()/cylinder() with the same number of fragments, so
+ * the sphere fits cylinders on any axis without slivers. All vertices are on
+ * the sphere, there is a vertex on each of the six poles and the mesh has the
+ * full symmetry of the octahedron.
+ *
+ * Interior vertices are placed using the algorithm posted by Bram Cohen in
+ * https://github.com/openscad/openscad/pull/6100#issuecomment-3229898933:
+ * the vertex with barycentric index (i, j, k), i + j + k = n, of the octant
+ * face is where the great-circle arcs joining the equally spaced edge points
+ * at "constant i", "constant j" and "constant k" meet. The three arcs do not
+ * pass exactly through one point, so the three pairwise intersections are
+ * averaged and projected back onto the sphere. This keeps the three-fold
+ * symmetry of each face and makes the edge lengths very even.
+ *
+ * Vertices are stored in rings around the z axis: ring 0 is the +z pole,
+ * ring t (1 <= t <= n) has 4*t vertices, t per quadrant, starting on the
+ * meridian at the +x side of the quadrant and going counterclockwise as seen
+ * from +z. Ring n is the equator and rings n+1..2n mirror rings n-1..0.
+ * Ring t starts at vertex index 1 + 2*t*(t-1), so the vertex at quadrant q
+ * (0..3) and position s (0..t-1) is at 1 + 2*t*(t-1) + q*t + s; ring_start[]
+ * below holds these offsets. Seen from +z (x right, y up) for n = 3 the top
+ * hemisphere is
+ *
+ *                        16
+ *                 17            15             ring 3 (equator): 13..24
+ *                        7
+ *            18     8         6     14         ring 2: 5..12
+ *                        2
+ *       19     9     3   0   1     5     13    ring 1: 1..4, pole: 0
+ *                        4
+ *            20    10        12     24
+ *                       11
+ *                 21            23
+ *                        22
+ *
+ * Between ring t and ring t+1 each quadrant has t+1 triangles with their apex
+ * on ring t and t triangles with their apex on ring t+1, see stitch() below.
+ */
+std::unique_ptr<PolySet> SphereNode::createGeometryOcta(int num_fragments) const
 {
-  if (this->r <= 0 || !std::isfinite(this->r)) {
-    return PolySet::createEmpty();
+  const int n = std::max(1, (num_fragments + 3) / 4);  // subdivisions per octahedron edge
+  const int fragments = 4 * n;                         // segments per equator
+
+  // Angle of the m-th of the n equally spaced points along an octahedron edge,
+  // computed as in generate_circle() so shared vertices are bit-identical.
+  std::vector<double> cos_table(n + 1), sin_table(n + 1);
+  for (int m = 0; m <= n; ++m) {
+    const double phi = (360.0 * m) / fragments;
+    cos_table[m] = cos_degrees(phi);
+    sin_table[m] = sin_degrees(phi);
   }
 
-  int num_fragments = discretizer.getCircularSegmentCount(r, 360.0).value_or(3);
-#ifdef ENABLE_PYTHON
-  if (this->r_func != nullptr) {
-    double fs = discretizer.getMinimalEdgeLength();
-    return sphereCreateFuncGeometry(this->r_func, fs, num_fragments);
+  // Where the great circles through (a, b) and (c, d) intersect (on the side
+  // of the sphere where the arcs are).
+  const auto arc_intersection = [](const Vector3d& a, const Vector3d& b, const Vector3d& c,
+                                   const Vector3d& d) -> Vector3d {
+    return a.cross(b).cross(c.cross(d)).normalized();
+  };
+
+  // Interior points of the first octant on the unit sphere, indexed like ring t,
+  // quadrant 0: octant[t][s] has barycentric index i = t - s, j = s, k = n - t.
+  // The other seven octants are exact rotations/mirrors of these. Points on the
+  // octahedron edges are not in this table, they are generated below.
+  std::vector<std::vector<Vector3d>> octant(n);
+  for (int t = 2; t < n; ++t) {
+    octant[t].resize(t);
+    const int k = n - t;
+    for (int s = 1; s < t; ++s) {
+      const int i = t - s;
+      const int j = s;
+      // Arc at constant k: joins the k-th point of the xz edge and of the yz edge.
+      const Vector3d xz_k(cos_table[k], 0, sin_table[k]);
+      const Vector3d yz_k(0, cos_table[k], sin_table[k]);
+      // Arc at constant j: joins the j-th point of the xy edge and the (n-j)-th of the yz edge.
+      const Vector3d xy_j(cos_table[j], sin_table[j], 0);
+      const Vector3d yz_j(0, cos_table[n - j], sin_table[n - j]);
+      // Arc at constant i: joins the (n-i)-th point of the xy edge and of the xz edge.
+      const Vector3d xy_i(cos_table[n - i], sin_table[n - i], 0);
+      const Vector3d xz_i(cos_table[n - i], 0, sin_table[n - i]);
+      octant[t][s] =
+        (arc_intersection(xz_k, yz_k, xy_j, yz_j) + arc_intersection(xz_k, yz_k, xy_i, xz_i) +
+         arc_intersection(xy_j, yz_j, xy_i, xz_i))
+          .normalized();
+    }
   }
-#endif
+
+  auto polyset = std::make_unique<PolySet>(3, /*convex*/ true);
+  polyset->vertices.reserve(4 * n * n + 2);
+  polyset->indices.reserve(8 * n * n);
+
+  std::vector<int> ring_start(2 * n + 1);
+  for (int ring = 0; ring <= 2 * n; ++ring) {
+    ring_start[ring] = static_cast<int>(polyset->vertices.size());
+    const bool top = ring <= n;
+    const int t = top ? ring : 2 * n - ring;  // rings away from the nearest pole
+    const int k = n - t;                      // edge points away from the equator
+    if (t == 0) {
+      polyset->vertices.emplace_back(0, 0, top ? r : -r);
+      continue;
+    }
+    for (int q = 0; q < 4; ++q) {
+      for (int s = 0; s < t; ++s) {
+        if (t == n) {
+          // Equator: the vertices of circle(r) with the same number of fragments.
+          const double phi = (360.0 * (q * n + s)) / fragments;
+          polyset->vertices.emplace_back(r * cos_degrees(phi), r * sin_degrees(phi), 0);
+        } else if (s == 0) {
+          // Meridian in the xz plane (even q) or yz plane (odd q): the vertices
+          // of that same circle rotated by rotate([90, 0, 0]) or rotate([90, 0, 90]).
+          const int idx = top ? (q < 2 ? k : 2 * n - k) : (q < 2 ? 4 * n - k : 2 * n + k);
+          const double phi = (360.0 * idx) / fragments;
+          const double c = r * cos_degrees(phi);
+          const double z = r * sin_degrees(phi);
+          if (q % 2 == 0) {
+            polyset->vertices.emplace_back(c, 0, z);
+          } else {
+            polyset->vertices.emplace_back(0, c, z);
+          }
+        } else {
+          const Vector3d& p = octant[t][s];
+          const double z = top ? p.z() : -p.z();
+          switch (q) {
+          case 0:  polyset->vertices.emplace_back(r * p.x(), r * p.y(), r * z); break;
+          case 1:  polyset->vertices.emplace_back(-r * p.y(), r * p.x(), r * z); break;
+          case 2:  polyset->vertices.emplace_back(-r * p.x(), -r * p.y(), r * z); break;
+          default: polyset->vertices.emplace_back(r * p.y(), -r * p.x(), r * z); break;
+          }
+        }
+      }
+    }
+  }
+  assert(polyset->vertices.size() == static_cast<size_t>(4 * n * n + 2));
+
+  // Triangulate the band between ring 'inner' (t vertices per quadrant) and the
+  // adjacent ring 'outer' (t + 1 per quadrant). The triangles are wound
+  // counterclockwise as seen from outside for the top hemisphere, and
+  // 'mirrored' reverses that for the bottom one.
+  const auto stitch = [&](int inner, int outer, int t, bool mirrored) {
+    const int inner_count = 4 * t;
+    const int outer_count = 4 * (t + 1);
+    const auto inner_index = [&](int i) {
+      return t == 0 ? ring_start[inner] : ring_start[inner] + i % inner_count;
+    };
+    const auto outer_index = [&](int i) { return ring_start[outer] + i % outer_count; };
+    const auto add = [&](int a, int b, int c) {
+      if (mirrored) {
+        polyset->indices.push_back({a, c, b});
+      } else {
+        polyset->indices.push_back({a, b, c});
+      }
+    };
+    for (int q = 0; q < 4; ++q) {
+      for (int s = 0; s <= t; ++s) {
+        const int i = q * t + s;
+        const int o = q * (t + 1) + s;
+        add(inner_index(i), outer_index(o), outer_index(o + 1));
+        if (s < t) {
+          add(inner_index(i), outer_index(o + 1), inner_index(i + 1));
+        }
+      }
+    }
+  };
+  for (int t = 0; t < n; ++t) {
+    stitch(t, t + 1, t, false);
+    stitch(2 * n - t, 2 * n - t - 1, t, true);
+  }
+  assert(polyset->indices.size() == static_cast<size_t>(8 * n * n));
+
+  return polyset;
+}
+
+// The original sphere: rings of latitude, offset by half a step so there are
+// no vertices on the poles, and none on the equator either (only on the x and y
+// axes, when num_fragments is 4i+2).
+std::unique_ptr<PolySet> SphereNode::createGeometryOrig(int num_fragments) const
+{
   auto num_rings = (num_fragments + 1) / 2;
   // Uncomment the following three lines to enable experimental sphere
   // tessellation
@@ -281,29 +488,71 @@ std::unique_ptr<const Geometry> SphereNode::createGeometry() const
   return polyset;
 }
 
-std::shared_ptr<const Geometry> SphereNode::dragPoint(const Vector3d& pt, const Vector3d& newpt,
-                                                      DragResult& result)
+std::unique_ptr<const Geometry> SphereNode::createGeometry() const
 {
-  if (dragflags & 1) {
-    r = newpt.norm();
+  if (this->r <= 0 || !std::isfinite(this->r)) {
+    return PolySet::createEmpty();
   }
-  return std::shared_ptr<const Geometry>(std::move(createGeometry()));
+
+  const int num_fragments = discretizer.getCircularSegmentCount(r).value_or(3);
+#ifdef ENABLE_PYTHON
+  if (this->r_func != nullptr) {
+    double fs = discretizer.getMinimalEdgeLength();
+    return sphereCreateFuncGeometry(this->r_func, fs, num_fragments);
+  }
+#endif
+
+  if (style == "octa") {
+    return createGeometryOcta(num_fragments);
+  } else {
+    return createGeometryOrig(num_fragments);
+  }
+}
+
+std::shared_ptr<const Geometry> SphereNode::dragPoint(const Vector3d& pt, const Vector3d& newpt,
+                                                      const Vector3d& dir, DragResult& result)
+{
+  if (r_ == 0) dragBegin();
+#ifdef ENABLE_PYTHON
+  if (r_func != nullptr) return createGeometry();  // radius given as function
+#endif
+  if (!(dragflags & 3)) return createGeometry();
+  // only react on vertices of this sphere
+  if (fabs(pt.norm() - r_) > DRAG_TOL * std::max(1.0, r_)) return createGeometry();
+  if (newpt.norm() < DRAG_MIN) return createGeometry();
+
+  r = std::max(dragSnap(newpt.norm(), DRAG_SNAP / 2), DRAG_MIN);
+  result.mods.clear();
+  if (dragflags & 1) result.mods.push_back(makeDragMod("r", 0, {}, r));
+  else result.mods.push_back(makeDragMod("d", 1, {}, 2 * r));
+  result.modname = "sphere";
+  result.line = py_line;
+  result.anchor = pt.normalized() * r;
+  return createGeometry();
 }
 
 static std::shared_ptr<AbstractNode> builtin_sphere(
   const std::shared_ptr<const ModuleInstantiation>& inst, Arguments arguments)
 {
-  Parameters parameters = Parameters::parse(std::move(arguments), inst->location(), {"r"}, {"d"});
+  Parameters parameters =
+    Parameters::parse(std::move(arguments), inst->location(), {"r"}, {"d", "style"});
+  parameters.set_caller("sphere");
 
   auto node = std::make_shared<SphereNode>(inst, CurveDiscretizer(parameters, inst->location()));
 
-  const auto r = lookup_radius(parameters, inst, "d", "r");
-  if (r.type() == Value::Type::NUMBER) {
-    node->r = r.toDouble();
-    if (OpenSCAD::rangeCheck && (node->r <= 0 || !std::isfinite(node->r))) {
-      LOG(message_group::Warning, inst->location(), parameters.documentRoot(), "sphere(r=%1$s)",
-          r.toEchoStringNoThrow());
-    }
+  std::string dr_var;
+  const auto r = parameters.lookupRadius(dr_var, "d", "r");
+  if (r) {
+    node->r = r->toDouble();
+  }
+
+  (void)parameters.valid("style", Value::Type::STRING);
+  const std::string style = parameters.get("style", node->style);
+  if (style == "orig" || style == "octa") {
+    node->style = style;
+  } else {
+    LOG(message_group::Warning, inst->location(), parameters.documentRoot(),
+        "sphere(style=\"%1$s\") is not \"orig\" or \"octa\", using \"%2$s\"", style, node->style);
   }
 
   return node;
@@ -380,19 +629,113 @@ std::unique_ptr<const Geometry> CylinderNode::createGeometry() const
   return polyset;
 }
 
-std::shared_ptr<const Geometry> CylinderNode::dragPoint(const Vector3d& pt, const Vector3d& newpt,
-                                                        DragResult& result)
+void CylinderNode::dragBegin()
 {
-  Vector3d x_ = newpt;
-  if (dragflags & 2) {
-    h = x_[2];
+  r1_ = r1;
+  r2_ = r2;
+  h_ = h;
+  angle_ = angle;
+}
+
+/*!
+  Which parameter changes depends on the grabbed vertex:
+  - a vertex of the bottom ring:  r1 / d1, else r / d
+  - a vertex of the top ring:     r2 / d2, else r / d
+  - top face (center=false) or any face (center=true): h
+  - the vertex at the end of the arc of a partial cylinder: angle
+ */
+std::shared_ptr<const Geometry> CylinderNode::dragPoint(const Vector3d& pt, const Vector3d& newpt,
+                                                        const Vector3d& dir, DragResult& result)
+{
+  if (h_ == 0) dragBegin();
+  if (!dragflags) return createGeometry();
+
+  const double tol = DRAG_TOL * std::max(1.0, std::max(h_, std::max(r1_, r2_)));
+  const double z1 = center ? -h_ / 2 : 0, z2 = center ? h_ / 2 : h_;
+  const bool on_bottom = fabs(pt[2] - z1) < tol, on_top = fabs(pt[2] - z2) < tol;
+  if (!on_bottom && !on_top) return createGeometry();
+  const double rho = Vector2d(pt[0], pt[1]).norm();
+  const double ring_r = on_top ? r2_ : r1_;
+  const bool on_ring = fabs(rho - ring_r) < tol && ring_r > 0;
+  if (!on_ring && rho > tol) return createGeometry();  // not a vertex of this cylinder
+
+  std::vector<DragMod> mods;
+  // The grabbed vertex moves vertically for h and horizontally for r and angle.
+  // Follow the mouse ray on that line / plane, not in the screen plane.
+  const Vector3d zaxis(0, 0, 1);
+  Vector3d hpt, rpt;
+  if (!dragRayLine(newpt, dir, pt, zaxis, hpt)) hpt = newpt;
+  if (!dragRayPlane(newpt, dir, pt, zaxis, rpt)) rpt = newpt;
+
+  // height
+  if (dragflags & CYL_DRAG_H) {
+    double newh = NAN;
+    if (center) newh = 2 * fabs(hpt[2]);
+    else if (on_top) newh = hpt[2];
+    if (!std::isnan(newh)) {
+      h = std::max(dragSnap(newh, DRAG_SNAP), DRAG_MIN);
+      mods.push_back(makeDragMod("h", 0, {}, h));
+    }
   }
-  x_[2] = 0;
-  if (dragflags & 1) {
-    r1 = x_.norm();
-    r2 = x_.norm();
+
+  // opening angle: grab the vertex at the end of the arc
+  bool angle_dragged = false;
+  if (on_ring && (dragflags & CYL_DRAG_ANGLE) && angle_ < 360) {
+    const double phi = atan2(pt[1], pt[0]) * 180 / M_PI;
+    double phi_pos = phi < 0 ? phi + 360 : phi;
+    if (fabs(phi_pos - angle_) * M_PI / 180 * ring_r < tol) {
+      double newang = atan2(rpt[1], rpt[0]) * 180 / M_PI;
+      if (newang <= 0) newang += 360;
+      angle = std::clamp(dragSnap(newang, DRAG_SNAP_ANG), DRAG_SNAP_ANG, 360.0);
+      mods.push_back(makeDragMod("angle", 8, {}, angle));
+      angle_dragged = true;
+    }
   }
-  return std::shared_ptr<const Geometry>(std::move(createGeometry()));
+
+  // radius
+  if (on_ring && !angle_dragged) {
+    const double newr = std::max(dragSnap(Vector2d(rpt[0], rpt[1]).norm(), DRAG_SNAP / 2), 0.0);
+    if (on_bottom && (dragflags & CYL_DRAG_R1)) {
+      r1 = newr;
+      mods.push_back(makeDragMod("r1", 1, {}, newr));
+    } else if (on_bottom && (dragflags & CYL_DRAG_D1)) {
+      r1 = newr;
+      mods.push_back(makeDragMod("d1", 6, {}, 2 * newr));
+    } else if (on_top && (dragflags & CYL_DRAG_R2)) {
+      r2 = newr;
+      mods.push_back(makeDragMod("r2", 2, {}, newr));
+    } else if (on_top && (dragflags & CYL_DRAG_D2)) {
+      r2 = newr;
+      mods.push_back(makeDragMod("d2", 7, {}, 2 * newr));
+    } else if (dragflags & CYL_DRAG_R) {
+      r1 = r2 = newr;
+      mods.push_back(makeDragMod("r", 4, {}, newr));
+    } else if (dragflags & CYL_DRAG_D) {
+      r1 = r2 = newr;
+      mods.push_back(makeDragMod("d", 5, {}, 2 * newr));
+    }
+    if (r1 <= 0 && r2 <= 0) {  // keep at least one radius
+      if (on_bottom) r1 = DRAG_SNAP / 2;
+      else r2 = DRAG_SNAP / 2;
+      mods.back().value = mods.back().name[0] == 'd' ? DRAG_SNAP : DRAG_SNAP / 2;
+    }
+  }
+  if (mods.empty()) return createGeometry();
+
+  // new position of the grabbed vertex
+  const double nz1 = center ? -h / 2 : 0, nz2 = center ? h / 2 : h;
+  Vector3d anchor(0, 0, on_top ? nz2 : nz1);
+  if (on_ring) {
+    const double nr = on_top ? r2 : r1;
+    const double a = angle_dragged ? angle * M_PI / 180 : atan2(pt[1], pt[0]);
+    anchor[0] = nr * cos(a);
+    anchor[1] = nr * sin(a);
+  }
+  result.modname = "cylinder";
+  result.line = py_line;
+  result.mods = mods;
+  result.anchor = anchor;
+  return createGeometry();
 }
 
 static std::shared_ptr<AbstractNode> builtin_cylinder(
@@ -401,30 +744,34 @@ static std::shared_ptr<AbstractNode> builtin_cylinder(
   Parameters parameters =
     Parameters::parse(std::move(arguments), inst->location(), {"h", "r1", "r2", "center", "angle"},
                       {"r", "d", "d1", "d2"});
+  parameters.set_caller("cylinder");
 
   auto node = std::make_shared<CylinderNode>(inst, CurveDiscretizer(parameters, inst->location()));
   if (parameters["h"].type() == Value::Type::NUMBER) {
     node->h = parameters["h"].toDouble();
   }
 
-  auto r = lookup_radius(parameters, inst, "d", "r");
-  auto r1 = lookup_radius(parameters, inst, "d1", "r1");
-  auto r2 = lookup_radius(parameters, inst, "d2", "r2");
-  if (r.type() == Value::Type::NUMBER &&
-      (r1.type() == Value::Type::NUMBER || r2.type() == Value::Type::NUMBER)) {
+  std::string dr_var;
+  std::string dr1_var;
+  std::string dr2_var;
+  auto r = parameters.lookupRadius(dr_var, "d", "r");
+  auto r1 = parameters.lookupRadius(dr1_var, "d1", "r1", false);
+  auto r2 = parameters.lookupRadius(dr2_var, "d2", "r2", false);
+  if (r && (r1 || r2)) {
     LOG(message_group::Warning, inst->location(), parameters.documentRoot(),
-        "Cylinder parameters ambiguous");
+        "Cylinder arguments ambiguous: both %1$s and %2$s specified", quoteVar(dr_var),
+        quoteVar(r1 ? dr1_var : dr2_var));
   }
 
-  if (r.type() == Value::Type::NUMBER) {
-    node->r1 = r.toDouble();
-    node->r2 = r.toDouble();
+  if (r) {
+    node->r1 = r->toDouble();
+    node->r2 = r->toDouble();
   }
-  if (r1.type() == Value::Type::NUMBER) {
-    node->r1 = r1.toDouble();
+  if (r1) {
+    node->r1 = r1->toDouble();
   }
-  if (r2.type() == Value::Type::NUMBER) {
-    node->r2 = r2.toDouble();
+  if (r2) {
+    node->r2 = r2->toDouble();
   }
 
   if (OpenSCAD::rangeCheck) {
@@ -432,12 +779,12 @@ static std::shared_ptr<AbstractNode> builtin_cylinder(
       LOG(message_group::Warning, inst->location(), parameters.documentRoot(), "cylinder(h=%1$s, ...)",
           parameters["h"].toEchoStringNoThrow());
     }
-    if (node->r1 < 0 || node->r2 < 0 || (node->r1 == 0 && node->r2 == 0) || !std::isfinite(node->r1) ||
-        !std::isfinite(node->r2)) {
+
+    // r==0 has already been covered by lookupRadius.
+    if (!r && node->r1 == 0 && node->r2 == 0) {
       LOG(message_group::Warning, inst->location(), parameters.documentRoot(),
-          "cylinder(r1=%1$s, r2=%2$s, ...)",
-          (r1.type() == Value::Type::NUMBER ? r1.toEchoStringNoThrow() : r.toEchoStringNoThrow()),
-          (r2.type() == Value::Type::NUMBER ? r2.toEchoStringNoThrow() : r.toEchoStringNoThrow()));
+          "cylinder(%1$s=%2$s, %3$s=%4$s, ...): cannot both be zero", dr1_var,
+          parameters[dr1_var].toEchoStringNoThrow(), dr2_var, parameters[dr2_var].toEchoStringNoThrow());
     }
   }
 
@@ -528,6 +875,32 @@ std::unique_ptr<const Geometry> PolyhedronNode::createGeometry() const
   p->colors = this->colors;
   p->color_indices = this->color_indices;
   return p;
+}
+
+std::shared_ptr<const Geometry> PolyhedronNode::dragPoint(const Vector3d& pt, const Vector3d& newpt,
+                                                          const Vector3d& dir, DragResult& result)
+{
+  if (point_dragflags.empty()) return createGeometry();
+  if (points_.size() != points.size()) dragBegin();
+
+  // grabbed vertex = first point at pt that has a marked coordinate
+  for (size_t i = 0; i < points_.size() && i < point_dragflags.size(); i++) {
+    const int flags = point_dragflags[i];
+    if (!flags || (points_[i] - pt).norm() > DRAG_TOL) continue;
+    std::vector<DragMod> mods;
+    const Vector3d target = dragConstrain(points_[i], newpt, dir, flags);
+    for (int k = 0; k < 3; k++) {
+      if (!(flags & (1 << k))) continue;
+      points[i][k] = dragSnap(target[k], DRAG_SNAP);
+      mods.push_back(makeDragMod("points", 0, {static_cast<int>(i), k}, points[i][k]));
+    }
+    result.modname = "polyhedron";
+    result.line = py_line;
+    result.mods = mods;
+    result.anchor = points[i];
+    break;
+  }
+  return createGeometry();
 }
 
 static std::shared_ptr<AbstractNode> builtin_polyhedron(
@@ -644,7 +1017,6 @@ std::unique_ptr<const Geometry> EdgeNode::createGeometry() const
   }
 
   Edge1d e(beg, end);
-  e.color = *OpenSCAD::parse_color("#f9d72c");
   Barcode1d b(e);
   return std::make_unique<Barcode1d>(b);
 }
@@ -664,7 +1036,6 @@ std::unique_ptr<const Geometry> SquareNode::createGeometry() const
 
   Outline2d o;
   o.vertices = {v1, {v2[0], v1[1]}, v2, {v1[0], v2[1]}};
-  o.color = *OpenSCAD::parse_color("#f9d72c");
   return std::make_unique<Polygon2d>(o);
 }
 
@@ -729,7 +1100,6 @@ std::unique_ptr<const Geometry> CircleNode::createGeometry() const
     double phi = (this->angle * i) / fragments_div;
     o.vertices[i] = {this->r * cos_degrees(phi), this->r * sin_degrees(phi)};
   }
-  o.color = *OpenSCAD::parse_color("#f9d72c");
   return std::make_unique<Polygon2d>(o);
 }
 
@@ -738,15 +1108,13 @@ static std::shared_ptr<AbstractNode> builtin_circle(
 {
   Parameters parameters =
     Parameters::parse(std::move(arguments), inst->location(), {"r"}, {"d", "angle"});
+  parameters.set_caller("circle");
   auto node = std::make_shared<CircleNode>(inst, CurveDiscretizer(parameters, inst->location()));
 
-  const auto r = lookup_radius(parameters, inst, "d", "r");
-  if (r.type() == Value::Type::NUMBER) {
-    node->r = r.toDouble();
-    if (OpenSCAD::rangeCheck && ((node->r <= 0) || !std::isfinite(node->r))) {
-      LOG(message_group::Warning, inst->location(), parameters.documentRoot(), "circle(r=%1$s)",
-          r.toEchoStringNoThrow());
-    }
+  std::string dr_var;
+  const auto r = parameters.lookupRadius(dr_var, "d", "r");
+  if (r) {
+    node->r = r->toDouble();
   }
 
   return node;
@@ -865,7 +1233,6 @@ std::unique_ptr<const Geometry> PolygonNode::createGeometry() const
   if (p->outlines().size() > 0) {
     p->setConvexity(convexity);
   }
-  p->setColor(*OpenSCAD::parse_color("#f9d72c"));
   return p;
 }
 
@@ -1011,7 +1378,6 @@ std::unique_ptr<const Geometry> SplineNode::createGeometry() const
     }
   }
   p->addOutline(result);
-  p->setColor(*OpenSCAD::parse_color("#f9d72c"));
   return p;
 }
 
@@ -1100,6 +1466,7 @@ void register_builtin_primitives()
                    "sphere(radius)",
                    "sphere(r = radius)",
                    "sphere(d = diameter)",
+                   "sphere(r = radius, style = \"octa\")",
                  });
 
   Builtins::init("cylinder", new BuiltinModule(builtin_cylinder),

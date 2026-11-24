@@ -16,6 +16,34 @@ option(USE_IMAGE_COMPARE_PY "Use built-in image_compare.py" ON)
 project(OpenSCADTests)
 enable_testing()
 
+# A dedicated GL harness is needed to change schemes on the same live renderer.
+# Separate CLI PNG exports cannot detect stale vertex buffers (issues #1203/#1204).
+if(TARGET OpenSCADLibInternal AND NOT NULLGL AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  add_executable(render-color-scheme-test render_color_scheme_test.cc)
+  target_link_libraries(render-color-scheme-test PRIVATE OpenSCADLibInternal svg)
+  # The inherited Windows resource file resolves scripts/winmanifest.xml from the repo root.
+  target_include_directories(render-color-scheme-test PRIVATE ${CMAKE_SOURCE_DIR})
+  # Python support changes node layouts but its definition is private to the library.
+  # Match all library definitions so the native test uses the same class ABI.
+  target_compile_definitions(render-color-scheme-test PRIVATE
+    "$<TARGET_PROPERTY:OpenSCADLibInternal,COMPILE_DEFINITIONS>")
+  get_target_property(_RENDER_COLOR_CXX_STANDARD OpenSCADLibInternal CXX_STANDARD)
+  set_target_properties(render-color-scheme-test PROPERTIES
+    CXX_STANDARD ${_RENDER_COLOR_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+  if(WIN32)
+    # Share the application's staged Python/libfive DLLs and software OpenGL runtime.
+    add_dependencies(render-color-scheme-test OpenSCADExe)
+    set_target_properties(render-color-scheme-test PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:OpenSCADExe>")
+  endif()
+  add_test(NAME render-color-scheme CONFIGURATIONS Default
+    COMMAND render-color-scheme-test ${CMAKE_SOURCE_DIR})
+  if(EXPERIMENTAL)
+    add_test(NAME render-color-scheme-indexing CONFIGURATIONS Default
+      COMMAND render-color-scheme-test ${CMAKE_SOURCE_DIR} --indexing)
+  endif()
+endif()
+
 # Very commonly used cmake-provided paths
 set(CBD ${CMAKE_BINARY_DIR}) # build top level
 set(CSD ${CMAKE_SOURCE_DIR}) # project top level
@@ -55,7 +83,6 @@ else() # !PROJECT_IS_TOP_LEVEL
   # Very commonly used cmake-provided paths
   set(CBD ${CMAKE_BINARY_DIR}) # build top level
   set(CSD ${CMAKE_SOURCE_DIR}) # project top level
-  set(LIBRARIES_DIR "${CSD}/libraries")
 
   if(APPLE)
     set(OPENSCAD_BINPATH "${CBD}/${EXECUTABLE_NAME}.app/Contents/MacOS/${EXECUTABLE_NAME}")
@@ -66,12 +93,6 @@ else() # !PROJECT_IS_TOP_LEVEL
   else()
     set(OPENSCAD_BINPATH "${CBD}/openscad${SUFFIX_WITH_DASH}")
   endif()
-
-  # MCAD
-  if(NOT EXISTS ${LIBRARIES_DIR}/MCAD/__init__.py)
-    message(FATAL_ERROR "MCAD not found. You can install from the OpenSCAD root as follows: \n  git submodule update --init --recursive")
-  endif()
-  list(APPEND CTEST_ENVIRONMENT "OPENSCADPATH=${LIBRARIES_DIR}")
 
   find_package(Lib3MF QUIET)
   # Disable LIB3MF tests if library was disabled in build
@@ -150,19 +171,11 @@ set(TEST_PYTHONSCAD_EXPORT_3MF_DIR     "${CCSD}/data/pythonscad-export-3mf")
 set(TEST_PYTHONSCAD_EXPORT_OBJ_DIR     "${CCSD}/data/pythonscad-export-obj")
 set(TEST_PYTHONSCAD_EXPORT_SVG_DIR     "${CCSD}/data/pythonscad-export-svg")
 set(TEST_PYTHONSCAD_EXPORT_POV_DIR     "${CCSD}/data/pythonscad-export-pov")
-# Note: there is intentionally no `pythonscad-export-amf` group --
-# AMF mesh tessellation (vertex order + triangle indexing) is not
-# stable across the CI matrix even with --enable=predictible-output
-# (see PR #590 / issue #586). Upstream OpenSCAD also has no
-# byte-compare `export-amf` ctest for the same reason; only the
-# render-PNG `render-amf_*` tests exist. AMF is also deprecated. If
-# determinism is fixed later, add a fixture under
-# tests/data/pythonscad-export-amf/ and an `add_export_files_test()`
-# entry below.
 set(TEST_PYTHONSCAD_OVERLAY_DIR "${CCSD}/data/pythonscad-overlay")
 set(TEST_PYTHONSCAD_OVERLAY_ECHO_DIR "${CCSD}/data/pythonscad-overlay-echo")
 set(TEST_CUSTOMIZER_DIR "${CCSD}/data/scad/customizer")
 set(TEST_PYTHON_DIR     "${CCSD}/data/python")
+list(APPEND CTEST_ENVIRONMENT "OPENSCADPATH=${TEST_DATA_DIR}/libraries")
 # Test runner Python scripts
 set(STLEXPORTSANITYTEST_PY   "${CCSD}/stlexportsanitytest.py")
 set(EXPORT_IMPORT_PNGTEST_PY "${CCSD}/export_import_pngtest.py")
@@ -301,11 +314,29 @@ file(GLOB PYTHONSCAD_OVERLAY_ECHO_FILES ${TEST_PYTHONSCAD_OVERLAY_ECHO_DIR}/*.py
 file(GLOB SCAD_3D_EXPORT_FILES      ${TEST_SCAD_DIR}/3d-export/*.scad)
 # Exclude add_parameter_pure.py as it has a separate test with feature flag
 list(REMOVE_ITEM PYTHONSCAD_ECHO_FILES "${TEST_PYTHONSCAD_ECHO_DIR}/add_parameter_pure.py")
+# Exclude add_parameter_types.py: needs -D seeding of finished Customizer values
+list(REMOVE_ITEM PYTHONSCAD_ECHO_FILES "${TEST_PYTHONSCAD_ECHO_DIR}/add_parameter_types.py")
+# export() is a no-op when preview=true (GUI F5 / CLI echo without --render).
+# Fixtures that must actually invoke python_export_core() run with --render.
+set(PYTHONSCAD_ECHO_EXPORT_FILES
+  "${TEST_PYTHONSCAD_ECHO_DIR}/export-error-handling.py"
+  "${TEST_PYTHONSCAD_ECHO_DIR}/issue587-export-non-str-keys.py"
+  "${TEST_PYTHONSCAD_ECHO_DIR}/issue232-lookup-file-export-deprecation.py"
+)
+list(REMOVE_ITEM PYTHONSCAD_ECHO_FILES ${PYTHONSCAD_ECHO_EXPORT_FILES})
+# GUI pointer callbacks and nimport() are not exposed in headless builds.
+if(HEADLESS)
+  list(REMOVE_ITEM PYTHONSCAD_ECHO_FILES "${TEST_PYTHONSCAD_ECHO_DIR}/gui_callback_abi.py")
+  list(REMOVE_ITEM PYTHONSCAD_ECHO_FILES "${TEST_PYTHONSCAD_ECHO_DIR}/nimport-deprecation.py")
+endif()
 # Exclude libfive tests if libfive is not enabled
 if(NOT ENABLE_LIBFIVE)
   list(REMOVE_ITEM PYTHONSCAD_FILES "${TEST_PYTHONSCAD_DIR}/libfive-union-stairs.py")
   list(REMOVE_ITEM PYTHONSCAD_FILES "${TEST_PYTHONSCAD_DIR}/sdf.py")
 endif()
+# 2D CSG fillet regression (#1004): SVG export, no OpenGL required.
+list(REMOVE_ITEM PYTHONSCAD_FILES "${TEST_PYTHONSCAD_DIR}/issue-1004-2d-fillet.py")
+set(PYTHONSCAD_2D_SVG_FILES "${TEST_PYTHONSCAD_DIR}/issue-1004-2d-fillet.py")
 if(NOT MINGW)
   # GhostScript on MSYS2/MINGW can't handle the names.
   list(APPEND SCAD_PDF_FILES
@@ -315,11 +346,13 @@ endif()
 
 file(GLOB SCAD_SVG_FILES      ${TEST_SCAD_DIR}/svg/svg-spec/*.scad
   ${TEST_SCAD_DIR}/svg/box-w-holes-2d.scad
+  ${TEST_SCAD_DIR}/svg/center-viewbox-offset.scad
   ${TEST_SCAD_DIR}/svg/display.scad
   ${TEST_SCAD_DIR}/svg/id-selection-test.scad
   ${TEST_SCAD_DIR}/svg/id-layer-selection-test.scad
   ${TEST_SCAD_DIR}/svg/line-cap-line-join.scad
   ${TEST_SCAD_DIR}/svg/simple-center-2d.scad
+  ${TEST_SCAD_DIR}/svg/tessellation-test.scad
   ${TEST_SCAD_DIR}/svg/use-transform.scad
   ${TEST_SCAD_DIR}/svg/fill-rule.scad
   ${TEST_SCAD_DIR}/svg/size-percent.scad
@@ -346,7 +379,6 @@ list(REMOVE_ITEM FEATURES_3D_FILES
 )
 file(GLOB DEPRECATED_3D_FILES ${TEST_SCAD_DIR}/3D/deprecated/*.scad)
 file(GLOB ISSUES_3D_FILES     ${TEST_SCAD_DIR}/3D/issues/*.scad)
-file(GLOB SCAD_AMF_FILES           ${TEST_SCAD_DIR}/amf/*.scad)
 file(GLOB SCAD_NEF3_FILES          ${TEST_SCAD_DIR}/nef3/*.scad)
 file(GLOB FUNCTION_FILES           ${TEST_SCAD_DIR}/functions/*.scad)
 file(GLOB REDEFINITION_FILES       ${TEST_SCAD_DIR}/redefinition/*.scad)
@@ -377,13 +409,13 @@ list(APPEND MISC_FILES
   ${TEST_SCAD_DIR}/misc/assert-tests.scad
   ${TEST_SCAD_DIR}/misc/let-module-tests.scad
   ${TEST_SCAD_DIR}/misc/localfiles-test.scad
-  ${TEST_SCAD_DIR}/misc/localfiles_dir/localfiles-compatibility-test.scad
   ${TEST_SCAD_DIR}/misc/allexpressions.scad
   ${TEST_SCAD_DIR}/misc/allfunctions.scad
   ${TEST_SCAD_DIR}/misc/allmodules.scad
   ${TEST_SCAD_DIR}/misc/special-consts.scad
   ${TEST_SCAD_DIR}/misc/utf8-☠-3D.scad
   ${TEST_SCAD_DIR}/misc/variable-overwrite.scad
+  ${TEST_SCAD_DIR}/misc/linear_extrude-segments-parameter-tests.scad
 )
 
 list(APPEND FAILING_FILES
@@ -397,6 +429,10 @@ list(APPEND ECHO_FILES ${FUNCTION_FILES} ${MISC_FILES} ${REDEFINITION_FILES}
   ${TEST_SCAD_DIR}/3D/features/for-tests.scad
   ${TEST_SCAD_DIR}/3D/features/rotate-parameters.scad
   ${TEST_SCAD_DIR}/3D/features/linear_extrude-parameter-tests.scad
+  ${TEST_SCAD_DIR}/3D/features/sphere-octa-tests.scad
+  ${TEST_SCAD_DIR}/json/import-json.scad
+  ${TEST_SCAD_DIR}/json/import-json-array.scad
+  ${TEST_SCAD_DIR}/json/import-json-relative-path.scad
   ${TEST_SCAD_DIR}/misc/expression-evaluation-tests.scad
   ${TEST_SCAD_DIR}/misc/echo-tests.scad
   ${TEST_SCAD_DIR}/misc/assert-fail1-test.scad
@@ -406,6 +442,7 @@ list(APPEND ECHO_FILES ${FUNCTION_FILES} ${MISC_FILES} ${REDEFINITION_FILES}
   ${TEST_SCAD_DIR}/misc/assert-fail5-test.scad
   ${TEST_SCAD_DIR}/misc/for-c-style-infinite-loop.scad
   ${TEST_SCAD_DIR}/misc/parser-tests.scad
+  ${TEST_SCAD_DIR}/issues/issue6942.scad
   ${TEST_SCAD_DIR}/misc/builtin-tests.scad
   ${TEST_SCAD_DIR}/misc/dim-all.scad
   ${TEST_SCAD_DIR}/misc/string-test.scad
@@ -464,6 +501,7 @@ list(APPEND ECHO_FILES ${FUNCTION_FILES} ${MISC_FILES} ${REDEFINITION_FILES}
   ${TEST_SCAD_DIR}/misc/root-modifier-for.scad
   ${TEST_DATA_DIR}/use-order-test/use-order-test.scad
   ${TEST_SCAD_DIR}/misc/linenumber.scad
+  ${TEST_SCAD_DIR}/issues/issue7013.scad
 )
 
 list(APPEND ASTDUMP_FILES ${MISC_FILES}
@@ -484,14 +522,13 @@ list(APPEND ASTDUMP_FILES ${MISC_FILES}
 list(APPEND DUMP_FILES ${FEATURES_2D_FILES} ${FEATURES_3D_FILES} ${DEPRECATED_3D_FILES} ${MISC_FILES})
 
 list(APPEND RENDER_2D_FILES ${FEATURES_2D_FILES} ${SCAD_DXF_FILES} ${ISSUES_2D_FILES} ${EXAMPLE_2D_FILES})
-list(APPEND RENDER_3D_FILES ${FEATURES_3D_FILES} ${SCAD_AMF_FILES} ${DEPRECATED_3D_FILES} ${ISSUES_3D_FILES} ${EXAMPLE_3D_FILES} ${SCAD_NEF3_FILES})
+list(APPEND RENDER_3D_FILES ${FEATURES_3D_FILES} ${DEPRECATED_3D_FILES} ${ISSUES_3D_FILES} ${EXAMPLE_3D_FILES} ${SCAD_NEF3_FILES})
 list(APPEND RENDER_3D_FILES
   ${TEST_SCAD_DIR}/misc/include-tests.scad
   ${TEST_SCAD_DIR}/misc/use-tests.scad
   ${TEST_SCAD_DIR}/misc/assert-tests.scad
   ${TEST_SCAD_DIR}/misc/let-module-tests.scad
   ${TEST_SCAD_DIR}/misc/localfiles-test.scad
-  ${TEST_SCAD_DIR}/misc/localfiles_dir/localfiles-compatibility-test.scad
   ${TEST_SCAD_DIR}/misc/rotate-empty-bbox.scad
   ${TEST_SCAD_DIR}/misc/empty-shape-tests.scad
   ${TEST_SCAD_DIR}/misc/internal-cavity.scad
@@ -910,10 +947,23 @@ add_cmdline_test(csgterm      OPENSCAD SUFFIX term FILES
 
 add_cmdline_test(echo         OPENSCAD SUFFIX echo FILES ${ECHO_FILES})
 
+# Unicode identifiers, NFC normalization, and the identifier security profile
+# are supported independently of experimental features.
+add_cmdline_test(echo OPENSCAD SUFFIX echo FILES ${TEST_SCAD_DIR}/misc/unicode-identifiers.scad)
+add_cmdline_test(echo OPENSCAD SUFFIX echo FILES ${TEST_CUSTOMIZER_DIR}/unicode-identifiers-parameters.scad ARGS -p ${TEST_CUSTOMIZER_DIR}/unicode-identifiers-parameters.json -P decomposedKeys)
+# Following -P argument: NFC: U+0047, U+0072, U+00F6, U+00DF; UTF-8: 47 72 C3 B6 C3 9F
+# JSON set name: NFD: U+0047, U+0072, U+006F, U+0308, U+00DF; UTF-8: 47 72 6F CC 88 C3 9F
+add_cmdline_test(echo-unicode-set-name-nfd OPENSCAD SUFFIX echo FILES ${TEST_CUSTOMIZER_DIR}/unicode-identifiers-parameters.scad EXPECTEDDIR echo ARGS -p ${TEST_CUSTOMIZER_DIR}/unicode-identifiers-parameters.json -P "Größ")
+# Following -P argument: NFD: U+0048, U+006F, U+0308, U+0068, U+0065; UTF-8: 48 6F CC 88 68 65
+# JSON set name: NFC: U+0048, U+00F6, U+0068, U+0065; UTF-8: 48 C3 B6 68 65
+add_cmdline_test(echo-unicode-set-name-nfc OPENSCAD SUFFIX echo FILES ${TEST_CUSTOMIZER_DIR}/unicode-identifiers-parameters.scad EXPECTEDDIR echo ARGS -p ${TEST_CUSTOMIZER_DIR}/unicode-identifiers-parameters.json -P "Höhe")
+add_failing_test(parsererrors SUFFIX csg FILES ${TEST_SCAD_DIR}/misc/unicode-identifiers-fail.scad ARGS --retval=1)
+
 # trace-usermodule-parameters is on by default,
 # but can generate very long outputs and potentially
 # unstable outputs, when combined with recursive tests.
 add_cmdline_test(echo         OPENSCAD SUFFIX echo FILES ${TEST_SCAD_DIR}/misc/recursion-test-vector.scad ARGS --trace-usermodule-parameters=false --trust-python)
+add_cmdline_test(echo-trace-depth OPENSCAD SUFFIX echo FILES ${TEST_SCAD_DIR}/misc/trace-depth.scad ARGS --trace-depth=3)
 
 add_cmdline_test(echo-stdio    OPENSCAD SUFFIX echo FILES ${TEST_SCAD_DIR}/misc/echo-tests.scad STDIO EXPECTEDDIR echo ARGS --export-format echo --trust-python)
 add_cmdline_test(echo         OPENSCAD SUFFIX echo FILES ${TEST_SCAD_DIR}/misc/builtin-invalid-range-test.scad ARGS --check-parameter-ranges=on --trust-python)
@@ -961,6 +1011,7 @@ add_cmdline_test(svgimport OPENSCAD ARGS --imgsize 600,600 --trust-python SUFFIX
   ${TEST_SCAD_DIR}/svg/extruded/simple-center.scad
   ${TEST_SCAD_DIR}/svg/extruded/stroke-closed-path.scad
   ${TEST_SCAD_DIR}/svg/extruded/dpi-default.scad
+  ${TEST_SCAD_DIR}/svg/extruded/fill-none-closed.scad
 )
 
 #
@@ -997,41 +1048,47 @@ list(APPEND EXPORT_3MF_TEST_FILES ${TEST_SCAD_DIR}/3mf/3mf-export.scad)
 list(APPEND EXPORT_3MF_LAZY_UNION_TEST_FILES ${TEST_SCAD_DIR}/experimental/lazyunion-color-cubes.scad)
 
 list(APPEND EXPORT_POV_TEST_FILES ${TEST_SCAD_DIR}/pov/pov-export.scad)
+list(APPEND EXPORT_POV_INVALID_COLOR_FILES ${TEST_SCAD_DIR}/pov/pov-export-invalid-color.scad)
+
+list(APPEND EXPORT_PARAM_TEST_FILES
+  ${TEST_SCAD_DIR}/issues/issue6597.scad
+  ${TEST_SCAD_DIR}/issues/issue7013.scad
+)
 
 list(APPEND EXPORT_IMPORT_3D_FILES
-${TEST_SCAD_DIR}/3D/features/mirror-tests.scad
-${TEST_SCAD_DIR}/3D/features/polyhedron-nonplanar-tests.scad
-${TEST_SCAD_DIR}/3D/features/rotate_extrude-tests.scad
-${TEST_SCAD_DIR}/3D/features/union-coincident-test.scad
-${TEST_SCAD_DIR}/3D/issues/fn_bug.scad
-${TEST_SCAD_DIR}/3D/issues/issue1105c.scad
-${TEST_SCAD_DIR}/3D/issues/issue1215.scad
-${TEST_SCAD_DIR}/3D/issues/issue1215b.scad
-${TEST_SCAD_DIR}/3D/issues/issue1221.scad
-${TEST_SCAD_DIR}/3D/issues/issue1225.scad
-${TEST_SCAD_DIR}/3D/issues/issue1258.scad
-${TEST_SCAD_DIR}/3D/issues/issue2259.scad
-${TEST_SCAD_DIR}/3D/issues/issue5216.scad
-${TEST_SCAD_DIR}/misc/bad-stl-pcbvicebar.scad
-${TEST_SCAD_DIR}/misc/bad-stl-tardis.scad
-${TEST_SCAD_DIR}/misc/bad-stl-wing.scad
-${TEST_SCAD_DIR}/misc/nonmanifold-polyhedron.scad
-${TEST_SCAD_DIR}/misc/preview_variable.scad
+  ${TEST_SCAD_DIR}/3D/features/mirror-tests.scad
+  ${TEST_SCAD_DIR}/3D/features/polyhedron-nonplanar-tests.scad
+  ${TEST_SCAD_DIR}/3D/features/rotate_extrude-tests.scad
+  ${TEST_SCAD_DIR}/3D/features/union-coincident-test.scad
+  ${TEST_SCAD_DIR}/3D/issues/fn_bug.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1105c.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1215.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1215b.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1221.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1225.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1258.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue2259.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue5216.scad
+  ${TEST_SCAD_DIR}/misc/bad-stl-pcbvicebar.scad
+  ${TEST_SCAD_DIR}/misc/bad-stl-tardis.scad
+  ${TEST_SCAD_DIR}/misc/bad-stl-wing.scad
+  ${TEST_SCAD_DIR}/misc/nonmanifold-polyhedron.scad
+  ${TEST_SCAD_DIR}/misc/preview_variable.scad
 )
 
 list(APPEND EXPORT_IMPORT_3D_DIFFERENT_FILES
-${TEST_SCAD_DIR}/3D/issues/issue904.scad
-${TEST_SCAD_DIR}/3D/issues/issue1105.scad
-${TEST_SCAD_DIR}/3D/issues/issue1105b.scad
-${TEST_SCAD_DIR}/3D/issues/issue1105d.scad
-${TEST_SCAD_DIR}/3D/issues/issue1215c.scad
-${TEST_SCAD_DIR}/misc/internal-cavity.scad
-${TEST_SCAD_DIR}/misc/internal-cavity-polyhedron.scad
-${TEST_SCAD_DIR}/misc/rotate_extrude-hole.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue904.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1105.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1105b.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1105d.scad
+  ${TEST_SCAD_DIR}/3D/issues/issue1215c.scad
+  ${TEST_SCAD_DIR}/misc/internal-cavity.scad
+  ${TEST_SCAD_DIR}/misc/internal-cavity-polyhedron.scad
+  ${TEST_SCAD_DIR}/misc/rotate_extrude-hole.scad
 )
 
 list(APPEND EXPORT_IMPORT_3D_DIFFERENT_MANIFOLD_FILES
-${TEST_SCAD_DIR}/3D/features/polyhedron-tests.scad
+  ${TEST_SCAD_DIR}/3D/features/polyhedron-tests.scad
 )
 
 #
@@ -1051,28 +1108,45 @@ ${TEST_SCAD_DIR}/3D/features/polyhedron-tests.scad
 
 
 # Export tests (compare actually exported files)
-add_cmdline_test(export-stl              EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} ARGS --enable=predictible-output --render --trust-python)
-add_cmdline_test(export-stl-stdout       EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} STDIO EXPECTEDDIR export-stl ARGS --enable=predictible-output --render --export-format asciistl --trust-python)
+add_cmdline_test(export-stl              EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} ARGS  --render --trust-python)
+add_cmdline_test(export-stl-stdout       EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} STDIO EXPECTEDDIR export-stl ARGS --render --export-format asciistl --trust-python)
 if (ENABLE_MANIFOLD_TESTS)
-add_cmdline_test(export-stl-manifold     EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} EXPECTEDDIR export-stl ARGS --enable=predictible-output --backend=manifold --render --trust-python)
+add_cmdline_test(export-stl-manifold     EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} EXPECTEDDIR export-stl ARGS  --backend=manifold --render --trust-python)
 endif()
 
-add_cmdline_test(export-binstl           EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} ARGS --enable=predictible-output --render --export-format binstl --trust-python)
-add_cmdline_test(export-binstl-stdout    EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} STDIO EXPECTEDDIR export-binstl ARGS --enable=predictible-output --render --export-format binstl --trust-python)
+add_cmdline_test(export-binstl           EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} ARGS  --render --export-format binstl --trust-python)
+add_cmdline_test(export-binstl-stdout    EXPERIMENTAL OPENSCAD SUFFIX stl FILES ${EXPORT_STL_TEST_FILES} STDIO EXPECTEDDIR export-binstl ARGS --render --export-format binstl --trust-python)
 
-add_cmdline_test(export-obj              EXPERIMENTAL OPENSCAD SUFFIX obj FILES ${EXPORT_OBJ_TEST_FILES} ARGS --enable=predictible-output --trust-python)
-add_cmdline_test(export-pov-as-is        EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --trust-python)
-add_cmdline_test(export-pov-translate-1  EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=0,0,0,0,0,0,140 --trust-python)
-add_cmdline_test(export-pov-translate-2  EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=10,0,0,0,0,0,140 --trust-python)
-add_cmdline_test(export-pov-translate-3  EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=0,10,0,0,0,0,140 --trust-python)
-add_cmdline_test(export-pov-translate-4  EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=0,0,10,0,0,0,140 --trust-python)
-add_cmdline_test(export-pov-rotate-1     EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=0,0,0,90,0,0,140 --trust-python)
-add_cmdline_test(export-pov-rotate-2     EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=0,0,0,0,90,0,140 --trust-python)
-add_cmdline_test(export-pov-rotate-3     EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=0,0,0,0,0,90,140 --trust-python)
-add_cmdline_test(export-pov-distance-1   EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=0,0,0,0,0,0,100 --trust-python)
-add_cmdline_test(export-pov-all          EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --enable=predictible-output --backend=manifold --camera=1,2,3,4,5,6,7 --trust-python)
+add_cmdline_test(export-obj              EXPERIMENTAL OPENSCAD SUFFIX obj FILES ${EXPORT_OBJ_TEST_FILES} ARGS  --trust-python)
+# linear_extrude(segments=...): the exported vertices show how each outline is subdivided.
+# The expected faces depend on how the caps are triangulated, which differs without Manifold.
+if (ENABLE_MANIFOLD_TESTS)
+file(GLOB LINEAR_EXTRUDE_SEGMENTS_FILES ${TEST_SCAD_DIR}/linear_extrude/linear_extrude-segments-*.scad)
+add_cmdline_test(linear_extrude-segments OPENSCAD SUFFIX obj FILES ${LINEAR_EXTRUDE_SEGMENTS_FILES})
+endif()
+add_cmdline_test(export-pov-as-is        EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS --backend=manifold --trust-python)
 
-add_cmdline_test(export-param            OPENSCAD SUFFIX json FILES "${TEST_SCAD_DIR}/issues/issue6597.scad" ARGS --export-format param)
+if (ENABLE_LIB3MF_TESTS)
+add_cmdline_test(export-3mf              EXPERIMENTAL OPENSCAD SUFFIX 3mf FILES ${EXPORT_3MF_LAZY_UNION_TEST_FILES} ARGS --enable=lazy-union)
+endif()
+add_cmdline_test(export-pov-translate-1  EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=0,0,0,0,0,0,140 --trust-python)
+add_cmdline_test(export-pov-translate-2  EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=10,0,0,0,0,0,140 --trust-python)
+add_cmdline_test(export-pov-translate-3  EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=0,10,0,0,0,0,140 --trust-python)
+add_cmdline_test(export-pov-translate-4  EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=0,0,10,0,0,0,140 --trust-python)
+add_cmdline_test(export-pov-rotate-1     EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=0,0,0,90,0,0,140 --trust-python)
+add_cmdline_test(export-pov-rotate-2     EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=0,0,0,0,90,0,140 --trust-python)
+add_cmdline_test(export-pov-rotate-3     EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=0,0,0,0,0,90,140 --trust-python)
+add_cmdline_test(export-pov-distance-1   EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=0,0,0,0,0,0,100 --trust-python)
+add_cmdline_test(export-pov-all          EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_TEST_FILES} ARGS  --backend=manifold --camera=1,2,3,4,5,6,7 --trust-python)
+add_cmdline_test(export-pov-invalid-color EXPERIMENTAL OPENSCAD SUFFIX pov FILES ${EXPORT_POV_INVALID_COLOR_FILES} ARGS --backend=manifold --trust-python)
+
+# Export parameters, observe exported files and console output
+add_cmdline_test(export-param            OPENSCAD SUFFIX json FILES ${EXPORT_PARAM_TEST_FILES} ARGS --export-format param)
+add_failing_test(export-param-hardwarnings        SUFFIX json FILES ${TEST_SCAD_DIR}/issues/issue7013.scad ARGS --retval=1 --export-format param --hardwarnings)
+add_failing_test(export-paramset-hardwarnings     SUFFIX json FILES ${TEST_SCAD_DIR}/issues/issue7013.scad ARGS --retval=1 --export-format param --hardwarnings -p ${TEST_SCAD_DIR}/issues/issue7013.json -P Defaults)
+
+add_cmdline_test(echo-param    OPENSCAD SUFFIX echo FILES ${TEST_SCAD_DIR}/issues/issue7013.scad ARGS -p ${TEST_SCAD_DIR}/issues/issue7013.json EXPECTEDDIR echo)
+add_cmdline_test(echo-paramset OPENSCAD SUFFIX echo FILES ${TEST_SCAD_DIR}/issues/issue7013.scad ARGS -p ${TEST_SCAD_DIR}/issues/issue7013.json -P Defaults)
 
 # Trivial Export/Import files: Sanity-checks bidirectional file format import/export
 set(SIMPLE_EXPORT_IMPORT_2D_FILES ${TEST_SCAD_DIR}/misc/square10.scad)
@@ -1093,7 +1167,6 @@ set(EXPORT_IMPORT_3D_RENDERMANIFOLD_FILES ${EXPORT_IMPORT_3D_RENDER_FILES})
 add_cmdline_test(render-monotone OPENSCAD SUFFIX png FILES ${EXPORT_IMPORT_3D_PREVIEW_FILES} ${SIMPLE_EXPORT_IMPORT_2D_FILES} ARGS --colorscheme=Monotone --render --trust-python)
 add_cmdline_test(preview-stl SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_PREVIEW_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=STL --trust-python)
 add_cmdline_test(preview-off SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_PREVIEW_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=OFF --trust-python)
-add_cmdline_test(preview-amf SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_PREVIEW_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=AMF --trust-python)
 add_cmdline_test(preview-obj SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_PREVIEW_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=OBJ --trust-python)
 
 add_cmdline_test(render-csg-cgal SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${RENDER_COMMON_FILES} EXPECTEDDIR render ARGS ${OPENSCAD_EXE_ARG} --format=csg --render --backend=cgal --trust-python)
@@ -1101,7 +1174,6 @@ add_cmdline_test(render-csg-cgal SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png F
 add_cmdline_test(render-stl SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_RENDER_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=STL --render=force)
 add_cmdline_test(render-off-cgal SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_RENDER_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=OFF --render=force --backend=cgal --trust-python)
 add_cmdline_test(render-off-cgal SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_DIFFERENT_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=OFF --render=force --backend=cgal --trust-python)
-add_cmdline_test(render-amf SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_RENDER_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=AMF --render=force --trust-python)
 add_cmdline_test(render-obj SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_RENDER_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=OBJ --render=force --trust-python)
 
 if (ENABLE_MANIFOLD_TESTS)
@@ -1121,7 +1193,6 @@ add_cmdline_test(render-off-manifold SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX p
 add_cmdline_test(render-stl-manifold SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_RENDERMANIFOLD_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=STL --render=force --backend=manifold --trust-python)
 add_cmdline_test(render-stl-manifold SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${FILES_MANIFOLD_CORNER_CASES} EXPECTEDDIR render-off-manifold ARGS ${OPENSCAD_EXE_ARG} --format=STL --render=force --backend=manifold --trust-python)
 
-add_cmdline_test(render-amf-manifold SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_RENDERMANIFOLD_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=AMF --render=force --backend=manifold --trust-python)
 add_cmdline_test(render-obj-manifold SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${EXPORT_IMPORT_3D_RENDERMANIFOLD_FILES} EXPECTEDDIR render-monotone ARGS ${OPENSCAD_EXE_ARG} --format=OBJ --render=force --backend=manifold --trust-python)
 add_cmdline_test(render-obj-manifold SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png FILES ${FILES_MANIFOLD_CORNER_CASES} EXPECTEDDIR render-off-manifold ARGS ${OPENSCAD_EXE_ARG} --format=OBJ --render=force --backend=manifold --trust-python)
 endif(ENABLE_MANIFOLD_TESTS)
@@ -1332,7 +1403,6 @@ list(APPEND EXPERIMENTAL_IMPORT_FILES
   ${TEST_SCAD_DIR}/json/import-json.scad
   ${TEST_SCAD_DIR}/json/import-json-relative-path.scad
   )
-add_cmdline_test(echo           EXPERIMENTAL OPENSCAD SUFFIX echo FILES ${EXPERIMENTAL_IMPORT_FILES} ARGS --enable=import-function --trust-python)
 
 #
 # --enable=textmetrics tests
@@ -1372,23 +1442,64 @@ add_cmdline_test(previewtest         EXPERIMENTAL OPENSCAD SUFFIX png FILES ${EX
 add_cmdline_test(previewmanifoldtest EXPERIMENTAL OPENSCAD SUFFIX png FILES ${EXPERIMENTAL_SKIN_FILES} ARGS --enable=skin --backend=manifold --trust-python)
 add_cmdline_test(throwntogethertest  EXPERIMENTAL OPENSCAD SUFFIX png FILES ${EXPERIMENTAL_SKIN_FILES} ARGS --preview=throwntogether --enable=skin --trust-python)
 add_cmdline_test(pythonscad          EXPERIMENTAL OPENSCAD SUFFIX png FILES ${PYTHONSCAD_FILES} ARGS --render --trust-python)
+# union(..., r=) fillets require full geometry evaluation; F5 preview must
+# still show them (issue #993). Share the --render expected image.
+add_cmdline_test(pythonscadpreview   EXPERIMENTAL OPENSCAD SUFFIX png FILES ${TEST_PYTHONSCAD_DIR}/issue-993-union-fillet.py EXPECTEDDIR pythonscad ARGS --trust-python)
+# 2D boolean seam fillets (issue #1004): validate via SVG (headless-safe).
+add_cmdline_test(pythonscad2d        EXPERIMENTAL OPENSCAD SUFFIX svg FILES ${PYTHONSCAD_2D_SVG_FILES} ARGS --render --trust-python)
 add_cmdline_test(pythonscadecho      EXPERIMENTAL OPENSCAD SUFFIX echo FILES ${PYTHONSCAD_ECHO_FILES} ARGS --trust-python)
+# The convexity regression needs CGAL explicitly: Manifold can accept a valid
+# mesh without consulting its convexity flag. Reuse the default echo golden.
+if(ENABLE_CGAL)
+  add_cmdline_test(pythonscadecho-cgal EXPERIMENTAL OPENSCAD SUFFIX echo
+    FILES ${TEST_PYTHONSCAD_ECHO_DIR}/pull-render-cavities.py
+    EXPECTEDDIR pythonscadecho ARGS --trust-python --backend=cgal)
+endif()
+# nimport download logs include machine-local library paths; keep the portable
+# DEPRECATED line + script prints in the golden file.
+if(NOT HEADLESS)
+  add_line_exclusion_for_test(pythonscadecho nimport-deprecation
+    [[^WARNING: Downloading to ]])
+  add_line_exclusion_for_test(pythonscadecho nimport-deprecation
+    [[^ERROR: ]])
+endif()
+# Same group name so goldens stay under tests/regression/pythonscadecho/.
+add_cmdline_test(pythonscadecho      EXPERIMENTAL OPENSCAD SUFFIX echo FILES ${PYTHONSCAD_ECHO_EXPORT_FILES} ARGS --trust-python --render)
 add_cmdline_test(pythonscadlaser     EXPERIMENTAL OPENSCAD SUFFIX svg FILES ${PYTHONSCAD_LASER_FILES}            ARGS --trust-python)
 add_cmdline_test(pythonscadoverlay      EXPERIMENTAL OPENSCAD SUFFIX png FILES ${PYTHONSCAD_OVERLAY_FILES} ARGS --render --trust-python)
 add_cmdline_test(pythonscadoverlayecho  EXPERIMENTAL OPENSCAD SUFFIX echo FILES ${PYTHONSCAD_OVERLAY_ECHO_FILES} ARGS --trust-python)
 add_cmdline_test(pythonscadecho_pure EXPERIMENTAL OPENSCAD SUFFIX echo FILES ${TEST_PYTHONSCAD_ECHO_DIR}/add_parameter_pure.py ARGS --enable=add-parameter-pure-function --trust-python)
+# Seed customizer_parameters_finished via -D so int defaults are reapplied as doubles (GUI re-preview path).
+add_cmdline_test(pythonscadecho_types EXPERIMENTAL OPENSCAD SUFFIX echo FILES ${TEST_PYTHONSCAD_ECHO_DIR}/add_parameter_types.py ARGS --trust-python "-Dfrom openscad import add_parameter as _ap$<SEMICOLON> _ap(\"int_param\", 256)$<SEMICOLON> _ap(\"float_param\", 256.0)$<SEMICOLON> _ap(\"str_param\", \"256\")")
 add_cmdline_test(echo EXPERIMENTAL OPENSCAD SUFFIX echo FILES ${TEST_SCAD_DIR}/misc/vector-swizzling.scad ARGS --enable=vector-swizzle --trust-python)
+
+if(EXPERIMENTAL AND ENABLE_PYTHON)
+# osuse() must search OpenSCAD's library paths after its existing script/CWD lookup.
+# Override only OPENSCADPATH for this fixture; retain the common CTest environment.
+  set(OSUSE_LIBRARY_TEST_NAME "pythonscadecho_osuse-library-path")
+  get_property(OSUSE_LIBRARY_TEST_ENV TEST ${OSUSE_LIBRARY_TEST_NAME} PROPERTY ENVIRONMENT)
+  set(OSUSE_LIBRARY_TEST_ENV_WITHOUT_PATH)
+  foreach(ENV_ENTRY IN LISTS OSUSE_LIBRARY_TEST_ENV)
+    if(NOT ENV_ENTRY MATCHES "^OPENSCADPATH=")
+      list(APPEND OSUSE_LIBRARY_TEST_ENV_WITHOUT_PATH "${ENV_ENTRY}")
+    endif()
+  endforeach()
+  list(APPEND OSUSE_LIBRARY_TEST_ENV_WITHOUT_PATH
+       "OPENSCADPATH=${TEST_DATA_DIR}/osuse-library-path")
+  set_property(TEST ${OSUSE_LIBRARY_TEST_NAME} PROPERTY
+               ENVIRONMENT "${OSUSE_LIBRARY_TEST_ENV_WITHOUT_PATH}")
+endif()
 
 #
 # 3D export tests (compare exported 3MF files)
 #
 # OpenSCAD DSL → 3MF export
 if (ENABLE_LIB3MF_TESTS)
-  add_cmdline_test(export-3d-scad OPENSCAD SUFFIX 3mf FILES ${SCAD_3D_EXPORT_FILES} ARGS --enable=predictible-output --render --trust-python)
+  add_cmdline_test(export-3d-scad OPENSCAD SUFFIX 3mf FILES ${SCAD_3D_EXPORT_FILES} ARGS  --render --trust-python)
 endif()
 # PythonSCAD → 3MF export
 if (ENABLE_LIB3MF_TESTS)
-  add_cmdline_test(export-3d-pythonscad EXPERIMENTAL OPENSCAD SUFFIX 3mf FILES ${PYTHONSCAD_3D_EXPORT_FILES} ARGS --enable=predictible-output --render --trust-python)
+  add_cmdline_test(export-3d-pythonscad EXPERIMENTAL OPENSCAD SUFFIX 3mf FILES ${PYTHONSCAD_3D_EXPORT_FILES} ARGS --render --trust-python)
 endif()
 
 #
@@ -1440,6 +1551,13 @@ if (ENABLE_LIB3MF_TESTS)
         EXPERIMENTAL
         FILES ${PYTHONSCAD_EXPORT_3MF_FILES}
     )
+    # Not globbed with the group above: lib3mf 2 only welds coincident
+    # vertices when predictible-output is on, and lib3mf 1 always does.
+    # The flag keeps the golden the same on both backends.
+    add_export_files_test(pythonscad-export-3mf-degenerate
+        EXPERIMENTAL
+        FILES "${CCSD}/data/pythonscad-3mf-degenerate/degenerate-triangle.py"
+    )
 endif()
 add_export_files_test(pythonscad-export-obj
     EXPERIMENTAL
@@ -1470,6 +1588,16 @@ endif()
 add_cmdline_test(dump-discretization-by-error EXPERIMENTAL OPENSCAD FILES ${EXPERIMENTAL_DISCRETIZATION_FILES} EXPECTEDDIR dump-discretization-by-error SUFFIX csg ARGS --enable=discretization-by-error)
 
 
+##################################
+# Multiple output files per call #
+##################################
+# The echo export installs an output handler which must not outlive the export,
+# otherwise the exports that follow it crash (issue #5614).
+
+add_test(NAME multiple-outputs_echo-stl_run CONFIGURATIONS Default COMMAND ${OPENSCAD_BINPATH} ${TEST_SCAD_DIR}/3D/features/cube-tests.scad -o multiple-outputs.echo -o multiple-outputs.stl)
+add_test(NAME multiple-outputs_echo-stl_check CONFIGURATIONS Default COMMAND ${CMAKE_COMMAND} -E cat multiple-outputs.stl)
+set_tests_properties(multiple-outputs_echo-stl_check PROPERTIES DEPENDS multiple-outputs_echo-stl_run)
+
 ############################
 # Relative filenames tests #
 ############################
@@ -1487,7 +1615,6 @@ endfunction()
 add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-tests.scad FORMAT stl)
 add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-tests.scad FORMAT off)
 add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-tests.scad FORMAT wrl)
-add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-tests.scad FORMAT amf)
 if (ENABLE_LIB3MF_TESTS)
   add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-tests.scad FORMAT 3mf)
 endif()
@@ -1501,6 +1628,34 @@ add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-test
 add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-tests.scad FORMAT term)
 add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-tests.scad FORMAT nef3)
 add_output_file_test(relative-output FILE ${TEST_SCAD_DIR}/3D/features/cube-tests.scad FORMAT nefdbg)
+
+###################################################
+# Raw EXPORT_CREATOR branding (POV / PDF / 3MF)
+#
+# Golden compares normalize PythonSCAD -> OpenSCAD, so a dedicated
+# unnormalized check is required to protect the branding change.
+# PDF creator metadata only exists when Cairo >= 1.16 (see
+# export_pdf.cc); older supported Cairo builds intentionally omit it.
+# PDF Creator is read via pdfinfo or Ghostscript pdf_info.ps when
+# present so Cairo 1.16 Info encodings are covered.
+###################################################
+set(_EXPORT_CREATOR_BRANDING_ARGS
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_export_creator_branding.py
+  ${OPENSCAD_BINPATH}
+  --pov-script ${TEST_SCAD_DIR}/pov/pov-export.scad
+)
+if (CAIRO_VERSION VERSION_GREATER_EQUAL "1.16.0")
+  list(APPEND _EXPORT_CREATOR_BRANDING_ARGS
+    --pdf-script ${TEST_SCAD_DIR}/export-creator/pdf.scad)
+endif()
+if (ENABLE_LIB3MF_TESTS)
+  list(APPEND _EXPORT_CREATOR_BRANDING_ARGS
+    --threemf-script ${TEST_SCAD_DIR}/3mf/3mf-export.scad)
+endif()
+add_test(NAME export-creator-branding CONFIGURATIONS Default
+  COMMAND ${Python3_EXECUTABLE} -Xutf8=1 ${_EXPORT_CREATOR_BRANDING_ARGS}
+)
+set_property(TEST export-creator-branding PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
 
 ###################################################
 # Python REPL / IPython smoke tests (issue ipython)
@@ -1544,6 +1699,14 @@ if(ENABLE_PYTHON)
       ${OPENSCAD_BINPATH}
   )
   set_property(TEST repl-smoke PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+
+  # Serialize interactive CLI smokes: concurrent --repl/--ipython
+  # pythonscad processes have been associated with flaky SIGBUS/SIGSEGV
+  # under Homebrew Python 3.15 on macos-26 (#1138 / #1149).
+  set_tests_properties(ipython-smoke ipython-fallback repl-smoke
+    PROPERTIES RUN_SERIAL TRUE
+    RESOURCE_LOCK "pythonscad_interactive_cli"
+  )
 
   add_test(NAME version-helpers CONFIGURATIONS Default
     COMMAND ${Python3_EXECUTABLE} -Xutf8=1
@@ -1617,6 +1780,105 @@ if(ENABLE_PYTHON)
   set_property(TEST ipython-precedence PROPERTY SKIP_REGULAR_EXPRESSION "^SKIP-")
 endif()
 
+# Host-side check that desktop/MIME/appdata/plist/MSIX association metadata
+# keeps .scad as default-eligible and .py as Open With only (no custom *.py MIME).
+if(Python3_EXECUTABLE)
+  add_test(NAME file-associations CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_file_associations.py
+  )
+  set_property(TEST file-associations PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+endif()
+
+# Host-side check for the delayed-release SHA compare used by
+# .github/workflows/update-submodule-manifold.yml. Independent of
+# ENABLE_PYTHON: it only needs bash, git, and the helper script.
+if(Python3_EXECUTABLE)
+  add_test(NAME compare-git-release CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_compare_git_release.py
+      ${CMAKE_SOURCE_DIR}/scripts/ci/compare-git-release.sh
+  )
+  set_property(TEST compare-git-release PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+  set_property(TEST compare-git-release PROPERTY SKIP_REGULAR_EXPRESSION "^SKIP")
+endif()
+
+# Exercise Windows packaging script contracts using host-side tool fixtures.
+find_program(RELEASE_SMOKE_POWERSHELL NAMES pwsh powershell)
+if(RELEASE_SMOKE_POWERSHELL)
+  add_test(NAME windows-smoke-run-lookup CONFIGURATIONS Default
+    COMMAND ${RELEASE_SMOKE_POWERSHELL} -NoProfile -ExecutionPolicy Bypass -File
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_smoke_lookup.ps1
+  )
+  if(Python3_EXECUTABLE)
+    add_test(NAME windows-smoke-input CONFIGURATIONS Default
+      COMMAND ${RELEASE_SMOKE_POWERSHELL} -NoProfile -ExecutionPolicy Bypass -File
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_smoke_input.ps1 ${Python3_EXECUTABLE}
+    )
+    if(WIN32)
+      find_program(RELEASE_SMOKE_LEGACY_POWERSHELL NAMES powershell)
+      if(RELEASE_SMOKE_LEGACY_POWERSHELL)
+        add_test(NAME windows-smoke-input-legacy CONFIGURATIONS Default
+          COMMAND ${RELEASE_SMOKE_LEGACY_POWERSHELL} -NoProfile -ExecutionPolicy Bypass -File
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_smoke_input.ps1 ${Python3_EXECUTABLE}
+        )
+      endif()
+    endif()
+  endif()
+endif()
+
+if(Python3_EXECUTABLE AND UNIX)
+  add_test(NAME linux-smoke-ownership CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_linux_smoke_ownership.py
+  )
+  set_property(TEST linux-smoke-ownership PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+  add_test(NAME release-smoke-dispatch CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_release_smoke_dispatch.py
+  )
+  set_property(TEST release-smoke-dispatch PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+  add_test(NAME release-smoke-run-lookup CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_release_smoke_lookup.py
+  )
+  set_property(TEST release-smoke-run-lookup PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+  add_test(NAME windows-python-packaging CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_python_packaging.py
+  )
+  set_property(TEST windows-python-packaging PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+endif()
+
+# Host-side checks for the macOS Homebrew dependency and release policies.
+if(Python3_EXECUTABLE)
+  add_test(NAME macosx-build-policy CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_macosx_build_homebrew.py
+  )
+  set_property(TEST macosx-build-policy PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+endif()
+
+# Host-side check that scripts/get-dependencies.py never drops a profile's
+# pre_commands/post_commands (e.g. the macOS Qt tap/pin sequence) when
+# combining profiles, regardless of combination order (#1134).
+if(Python3_EXECUTABLE)
+  add_test(NAME get-dependencies-profile-merge CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_get_dependencies_profile_merge.py
+  )
+  set_property(TEST get-dependencies-profile-merge PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+endif()
+
+# Host-side check for the platform-specific PythonSCAD startup-file location.
+if(Python3_EXECUTABLE)
+  add_test(NAME pythonscadrc-config-path CONFIGURATIONS Default
+    COMMAND ${Python3_EXECUTABLE} -Xutf8=1
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_pythonscadrc_config_path.py
+  )
+  set_property(TEST pythonscadrc-config-path PROPERTY ENVIRONMENT ${CTEST_ENVIRONMENT})
+endif()
+
 if(NOT ENABLE_LIBFIVE)
   message(STATUS "LIBFIVE is not enabled. Skipping related tests.")
   disable_tests_safe(
@@ -1686,16 +1948,13 @@ disable_tests_safe(
   render-csg-cgal_minkowski3-difference-test
   preview-cgal_minkowski3-difference-test
 
-  # https://github.com/openscad/openscad/issues/909
-  preview-amf_polyhedron-single-triangle
-  render-amf_bad-stl-tardis
-  render-amf_bad-stl-pcbvicebar
-  render-amf_bad-stl-wing
-
   # When exported from CGAL, the file cannot be re-imported
   render-stl_bad-stl-wing
+  render-off-cgal_bad-stl-tardis
   render-off-cgal_bad-stl-wing
   render-obj_bad-stl-wing
+  render-3mf-cgal_bad-stl-tardis
+  render-3mf-cgal_bad-stl-wing
 
   # https://github.com/openscad/openscad/issues/2301
   render-cgal_issue2301
@@ -1740,11 +1999,6 @@ disable_tests_safe(
   render-manifold_color-tests
   render-manifold_hex-colors-tests
 
-  # https://github.com/openscad/openscad/issues/909
-  render-amf-manifold_bad-stl-wing
-  render-amf-manifold_bad-stl-pcbvicebar
-  render-amf-manifold_bad-stl-tardis
-
   # https://github.com/openscad/openscad/issues/2841
   render-manifold_issue2841b
   preview-manifold_issue2841b
@@ -1785,8 +2039,6 @@ disable_tests_safe(
   preview-manifold_3mf-import-centered
   preview-manifold_import_3mf-tests
   render-off-manifold_issue5216
-  render-3mf-cgal_bad-stl-tardis
-  render-3mf-cgal_bad-stl-wing
   render-3mf-manifold_issue5216
 
   preview-cgal_import_3mf-tests
@@ -1794,6 +2046,16 @@ disable_tests_safe(
   render-csg-cgal_import_3mf-tests
   throwntogether-cgal_import_3mf-tests
   throwntogether-manifold_import_3mf-tests
+
+  # Requires MCAD which is no longer bundled (#6982)
+  dump-examples_example023
+  render-cgal_example023
+  render-manifold_example023
+  preview-cgal_example023
+  preview-manifold_example023
+  throwntogether-cgal_example023
+  throwntogether-manifold_example023
+  render-csg-cgal_example023
 )
 
 list(APPEND NEF3_BROKEN_TESTS
@@ -1805,6 +2067,44 @@ list(APPEND NEF3_BROKEN_TESTS
 
 # Platform specific test disable
 if(APPLE)
+  # GitHub-hosted macOS ARM VMs use Apple's software OpenGL renderer, which
+  # garbles some PNG image tests (dFdy/fwidth and related artifacts).
+  # This is not an Apple Silicon GPU bug. See:
+  #   https://github.com/openscad/openscad/issues/5201
+  #   https://github.com/actions/runner-images/issues/9712
+  # SVG path tessellation also differs on ARM vs the Intel golden files:
+  #   https://github.com/openscad/openscad/issues/6161
+  # OpenSCAD still skips ARM CI for the same renderer reason; there is no
+  # Mesa/OSMesa workaround in tree. Only disable under CI so real M-series
+  # GPUs keep coverage.
+  if((CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$") AND DEFINED ENV{CI})
+    disable_tests_safe(
+      lazyunion-preview_lazyunion-intersection-for
+
+      export-svg_spec-paths-arcs01
+      export-svg-fill-stroke_spec-paths-arcs01
+      export-svg-fill-only_spec-paths-arcs01
+
+      # ARM vs Intel floating-point noise in printed rotation matrices
+      pythonscadecho_solid-attributes
+      # pexpect/IPython ANSI handshake EOF on GitHub-hosted ARM VMs
+      ipython-pty
+    )
+    # svgviewbox-* are PNG comparisons of SVG viewBox rendering; the
+    # software renderer flakes across the whole family, not just one file.
+    foreach(TEST ${SVG_VIEWBOX_TESTS})
+      disable_tests_safe(svgviewbox-${TEST}_viewbox-test)
+    endforeach()
+    # Camera/imgsize/imgstretch/preview PNG tests flake under Apple's
+    # software renderer, same as svgimport. Skip those prefixes wholesale.
+    # (openscad-img covers imgsize, imgstretch, and imgstretch2.)
+    get_property(_apple_arm_ci_tests DIRECTORY PROPERTY TESTS)
+    foreach(_t ${_apple_arm_ci_tests})
+      if(_t MATCHES "^(svgimport_|openscad-cam|openscad-img|preview-cgal_|preview-manifold_)")
+        disable_tests_safe(${_t})
+      endif()
+    endforeach()
+  endif()
 elseif(UNIX)
 elseif(WIN32 OR MXECROSS)
   set_tests_properties(
@@ -1832,6 +2132,7 @@ if(NOT ENABLE_MANIFOLD)
     export-pov-rotate-3_pov-export
     export-pov-distance-1_pov-export
     export-pov-all_pov-export
+    export-pov-invalid-color_pov-export-invalid-color
     render-3mf-manifold_bad-stl-tardis
     render-3mf-manifold_bad-stl-wing
     render-3mf-manifold_issue904
@@ -1880,6 +2181,16 @@ disable_tests_safe(
 	render-cgal_2dcolor_union
 	render-csg-cgal_2dcolor_union
 	render-dxf_2dcolor_union
+)
+
+###############################
+# Test harness's own behaviour #
+###############################
+
+# Needs no OpenSCAD binary: it exercises test_pretty_print.py's log-file selection directly.
+add_test(NAME pretty_print_logfile
+  CONFIGURATIONS Default
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_pretty_print_logfile.py
 )
 
 ####################

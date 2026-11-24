@@ -76,6 +76,53 @@ The `twist` parameter can also be a Python function:
 
 ---
 
+## loft
+
+Create a cross-section function that transitions between two 2D shapes. Pass
+the result to `linear_extrude()` to build the lofted solid.
+
+**Syntax:**
+
+=== "Python"
+
+    ```python
+    loft(shape1, shape2, height, n=20, rot=0)
+    ```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `shape1` | 2D solid | — | Cross-section at height `0` |
+| `shape2` | 2D solid | — | Cross-section at `height` |
+| `height` | number | — | Height over which to interpolate; must be non-zero |
+| `n` | int | `20` | Minimum number of additional angular samples |
+| `rot` | number | `0` | Rotation of the second profile in degrees |
+
+`loft()` samples each outline radially from the origin and returns a function
+`f(h) -> [[x, y], ...]`. The input shapes should therefore surround the origin
+and have one unambiguous boundary intersection in each direction (for example,
+centered convex shapes).
+
+**Example:**
+
+=== "Python"
+
+    ```python
+    from pythonscad import *
+
+    profile = loft(
+        square(10, center=True),
+        circle(r=3, fn=24),
+        height=20,
+        n=24,
+        rot=45,
+    )
+    linear_extrude(profile, height=20, slices=20).show()
+    ```
+
+---
+
 ## rotate_extrude
 
 Extrude a 2D shape by rotating it around the Z axis.
@@ -86,7 +133,7 @@ Extrude a 2D shape by rotating it around the Z axis.
 
     ```python
     rotate_extrude(obj, convexity=1, scale=1.0, angle=360, twist=None,
-                   origin=None, offset=None, v=None, method=None)
+                   origin=None, offset=None, v=None, method="centered")
     obj.rotate_extrude(...)
     ```
 
@@ -102,7 +149,7 @@ Extrude a 2D shape by rotating it around the Z axis.
 | `origin` | `[x, y]` | `None` | Origin for twist/scale |
 | `offset` | `[x, y]` | `None` | Offset for the profile |
 | `v` | `[x, y, z]` | `None` | Translation per revolution for helix (PythonSCAD extension) |
-| `method` | string | `None` | Extrusion method |
+| `method` | string | `"centered"` | Helix pitch method: `"centered"` (use mid-X of the profile) or `"linear"` |
 | `fn`, `fa`, `fs` | | — | Curve discretization parameters |
 
 **PythonSCAD extensions:**
@@ -160,7 +207,8 @@ Extrude a 2D shape along an arbitrary 3D path. A 4th value in each path vertex s
 
     ```python
     path_extrude(obj, path, xdir=None, convexity=1, origin=None,
-                 scale=None, twist=None, closed=False, fn=-1, fa=-1, fs=-1)
+                 scale=None, twist=None, closed=False,
+                 allow_intersect=False, fn=-1, fa=-1, fs=-1)
     obj.path_extrude(path, ...)
     ```
 
@@ -176,6 +224,7 @@ Extrude a 2D shape along an arbitrary 3D path. A 4th value in each path vertex s
 | `scale` | `[x, y]` | `None` | Scale factor at the end |
 | `twist` | number or function | `None` | Twist angle or function |
 | `closed` | bool | `False` | Close the path into a loop |
+| `allow_intersect` | bool | `False` | When `False`, warn if consecutive extruded profiles appear to collide (cross-section vertices behind the previous profile plane). This is not a full path self-intersection test |
 | `fn`, `fa`, `fs` | float | `-1` | Curve discretization |
 
 **Examples:**

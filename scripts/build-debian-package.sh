@@ -24,7 +24,6 @@ set -euo pipefail  # Exit on error, undefined variables, and pipe failures
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
 readonly NC='\033[0m' # No Color
 
 # Helper functions
@@ -144,9 +143,11 @@ if [ "${USE_QT6:-ON}" = "OFF" ]; then
     sed -i 's/qt6-base-dev/qtbase5-dev/g' "${PROJECT_ROOT}/debian/control"
     sed -i 's/libqt6svg6-dev/libqt5svg5-dev/g' "${PROJECT_ROOT}/debian/control"
     sed -i 's/libqscintilla2-qt6-dev/libqscintilla2-qt5-dev/g' "${PROJECT_ROOT}/debian/control"
-    sed -i 's/libqt6core5compat6-dev/libqt5opengl5-dev/g' "${PROJECT_ROOT}/debian/control"
+    sed -i 's/libqt6core5compat6-dev | qt6-5compat-dev/libqt5opengl5-dev/g' "${PROJECT_ROOT}/debian/control"
     sed -i 's/qt6-multimedia-dev/qtmultimedia5-dev/g' "${PROJECT_ROOT}/debian/control"
     sed -i 's/qt6-tools-dev/qttools5-dev/g' "${PROJECT_ROOT}/debian/control"
+    # Ubuntu 22.04 has no python3-pyqt6. The Qt5 package ships without it.
+    sed -i 's/, python3-pyqt6//' "${PROJECT_ROOT}/debian/control"
     # Update description
     sed -i 's/Qt6-based/Qt5-based/g' "${PROJECT_ROOT}/debian/control"
 else
@@ -188,8 +189,6 @@ fi
 
 # The .deb file is created in the parent directory
 DEB_FILE="../pythonscad_${VERSION}-1_${ARCH}.deb"
-CHANGES_FILE="../pythonscad_${VERSION}-1_${ARCH}.changes"
-BUILDINFO_FILE="../pythonscad_${VERSION}-1_${ARCH}.buildinfo"
 
 if [ ! -f "$DEB_FILE" ]; then
     die "Expected .deb file not found: $DEB_FILE"

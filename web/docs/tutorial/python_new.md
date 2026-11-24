@@ -259,10 +259,10 @@ from pythonscad import *
 background = cube([200, 100, 1]).color("blue")
 star       = cylinder(r=20, h=2, fn=5).translate([100, 50, -0.5]).color("red")
 
-exporter = MultiToolExporter("out/flag-", ".stl", mkdir=True)
+exporter = MultiToolExporter()
 exporter.append(("blue", background))  # blue: rectangle minus the star area
 exporter.append(("red",  star))        # red: the star itself (later wins)
-exporter.export()
+exporter.export(prefix="out/flag-", suffix=".stl", mkdir=True)
 # writes out/flag-blue.stl and out/flag-red.stl
 
 # Or write one 3MF file with "blue" and "red" as separate named objects.
@@ -273,6 +273,20 @@ exporter.export(single_file="out/flag.3mf")
 files, and items can also be seeded directly via the constructor's
 `items=[...]` argument. See
 [Multi-tool Export](../reference/multitool.md) for the full reference.
+
+## polygon corner radius
+
+`polygon` points may include an optional third value: a corner fillet radius.
+`[x, y]` (or `[x, y, 0]`) stays sharp; `[x, y, r]` replaces that vertex with a circular arc of radius `r`. Use `fn`/`fa`/`fs` to control arc resolution. This is handy for `rotate_extrude` profiles where you want smooth transitions between slopes:
+
+```python
+from pythonscad import *
+
+pts = [[0, 0], [5, 0], [2, 25, 3], [4, 30, 1.5], [0, 30]]
+polygon(pts, fn=32).rotate_extrude(fn=64).show()
+```
+
+See [polygon](../reference/primitives2d.md#polygon) for details. Note that `polyline` uses a third coordinate as **Z** (3D path), not as a fillet radius.
 
 ## spline
 

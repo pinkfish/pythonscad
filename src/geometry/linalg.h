@@ -63,12 +63,33 @@ public:
   Color4f(int r, int g, int b, int a = 255) { setRgba(r, g, b, a); }
   Color4f(float r = -1.0f, float g = -1.0f, float b = -1.0f, float a = -1.0f) : color_(r, g, b, a) {}
 
+  // Like the unpainted (-1) sentinel, this carries no explicit RGBA color.
+  // Preserve the cut-surface role through mesh operations until display time.
+  [[nodiscard]] static Color4f defaultCutout() { return Color4f(-2.0f, -2.0f, -2.0f, -2.0f); }
+  [[nodiscard]] bool isDefaultCutout() const { return *this == defaultCutout(); }
+
+  [[nodiscard]] Color4f resolved(const Color4f& material, const Color4f& cutout) const
+  {
+    Color4f result = isDefaultCutout() ? cutout : material;
+    if (hasRgb()) result.setRgb(r(), g(), b());
+    if (hasAlpha()) result.setAlpha(a());
+    return result;
+  }
+
   [[nodiscard]] bool isValid() const { return color_.minCoeff() >= 0.0f; }
   [[nodiscard]] bool hasRgb() const
   {
     return color_[0] >= 0.0f && color_[1] >= 0.0f && color_[2] >= 0.0f;
   }
   [[nodiscard]] bool hasAlpha() const { return color_[3] >= 0.0f; }
+  // SVG fill:none is stored as a valid fully-transparent color so 2D SVG
+  // export can round-trip fill="none". 3D faces should not inherit that
+  // paint; return the unpainted sentinel so renderers use the scheme default.
+  [[nodiscard]] Color4f unpaintedIfFullyTransparent() const
+  {
+    if (isValid() && a() == 0.0f) return Color4f();
+    return *this;
+  }
 
   void setRgba(int r, int g, int b, int a = 255)
   {

@@ -55,6 +55,7 @@
 #include "version.h"
 // hash double
 #include "geometry/linalg.h"
+#include "handle_dep.h"
 
 #if defined __WIN32__ || defined _MSC_VER
 #include <process.h>
@@ -743,8 +744,13 @@ static VectorType search(const str_utf8_wrapper& find, const VectorType& table,
             j, (index_col_num + 1), table[j].toEchoStringNoThrow());
         return {session};
       }
-      if (!ft.empty() &&
-          ft.get_utf8_char() == entryVec[index_col_num].toStrUtf8Wrapper().get_utf8_char()) {
+      const auto& entry = entryVec[index_col_num];
+      if (entry.type() != Value::Type::STRING) {
+        // Just as "==" silently treats a type mismatch as not-equal, we treat a type mismatch
+        // as not matching.
+        continue;
+      }
+      if (!ft.empty() && ft.get_utf8_char() == entry.toStrUtf8Wrapper().get_utf8_char()) {
         matchCount++;
         if (num_returns_per_match == 1) {
           returnvec.emplace_back(double(j));
@@ -1035,6 +1041,22 @@ Value builtin_fontmetrics(Arguments arguments, const Location& loc)
   return std::move(font_metrics);
 }
 
+Value builtin_fragments(Arguments arguments, const Location& loc)
+{
+  Parameters parameters = Parameters::parse(std::move(arguments), loc, {"r"}, {"d"});
+  parameters.set_caller("fragments");
+
+  double r = 1.0;
+  std::string dr_var;
+  const auto rValue = parameters.lookupRadius(dr_var, "d", "r");
+  if (rValue) {
+    r = rValue->toDouble();
+  }
+
+  CurveDiscretizer discretizer(parameters, loc);
+  return discretizer.getCircularSegmentCount(r).value_or(3);
+}
+
 Value builtin_is_undef(const std::shared_ptr<const Context>& context, const FunctionCall *call)
 {
   if (call->arguments.size() != 1) {
@@ -1101,11 +1123,37 @@ Value builtin_is_object(Arguments arguments, const Location& loc)
 Value builtin_import(Arguments arguments, const Location& loc)
 {
   auto session = arguments.session();
-  const Parameters parameters = Parameters::parse(std::move(arguments), loc, {}, {"file"});
+  const Parameters parameters = Parameters::parse(std::move(arguments), loc, {}, {"file", "type"});
+  std::string type = parameters.get("type", "");
   std::string raw_filename = parameters.get("file", "");
-  std::string file =
-    lookup_file(raw_filename, loc.filePath().parent_path().string(), parameters.documentRoot());
-  return import_json(file, session, loc);
+
+  std::string file = lookup_file(raw_filename, loc.filePath().parent_path().string(), ".");
+  if (!file.empty()) handle_dep(file);
+
+  if (type.empty()) {
+    // Not explicitly specified; derive the file type from its extension.
+    std::string extraw = fs::path(file).extension().generic_string();
+    std::string ext = boost::algorithm::to_lower_copy(extraw);
+    if (ext == ".json") {
+      type = "json";
+    } else if (ext.empty()) {
+      LOG(message_group::Warning, loc, arguments.documentRoot(),
+          "No file extension or type while trying to import '%1$s'", raw_filename);
+      return Value::undefined.clone();
+    } else {
+      LOG(message_group::Warning, loc, arguments.documentRoot(),
+          "Unsupported file extension '%1$s' while trying to import '%2$s'", ext, raw_filename);
+      return Value::undefined.clone();
+    }
+  }
+
+  if (type == "json") {
+    return import_json(file, session, loc);
+  } else {
+    LOG(message_group::Warning, loc, arguments.documentRoot(),
+        "Unsupported file type '%1$s' while trying to import '%2$s'", type, raw_filename);
+    return Value::undefined.clone();
+  }
 }
 
 void register_builtin_functions()
@@ -1207,6 +1255,7 @@ void register_builtin_functions()
                  {
                    "len(string) -> number",
                    "len(vector) -> number",
+                   "len(object) -> number",
                  });
 
   Builtins::init("log", new BuiltinFunction(&builtin_log),
@@ -1231,15 +1280,13 @@ void register_builtin_functions()
                    "chr(range) -> string",
                  });
 
-  Builtins::init("textmetrics",
-                 new BuiltinFunction(&builtin_textmetrics, &Feature::ExperimentalTextMetricsFunctions),
+  Builtins::init("textmetrics", new BuiltinFunction(&builtin_textmetrics),
                  {
                    "textmetrics(text, size, font, direction, language, script, halign, valign, spacing, "
                    "em) -> object",
                  });
 
-  Builtins::init("fontmetrics",
-                 new BuiltinFunction(&builtin_fontmetrics, &Feature::ExperimentalTextMetricsFunctions),
+  Builtins::init("fontmetrics", new BuiltinFunction(&builtin_fontmetrics),
                  {
                    "fontmetrics(size, font, em) -> object",
                  });
@@ -1325,24 +1372,27 @@ void register_builtin_functions()
                    "is_function(arg) -> boolean",
                  });
 
-  Builtins::init("is_object",
-                 new BuiltinFunction(&builtin_is_object, &Feature::ExperimentalTextMetricsFunctions),
+  Builtins::init("is_object", new BuiltinFunction(&builtin_is_object),
                  {
                    "is_object(arg) -> boolean",
                  });
 
-  Builtins::init("object", new BuiltinFunction(&builtin_object, &Feature::ExperimentalObjectFunction),
+  Builtins::init("object", new BuiltinFunction(&builtin_object),
                  {
                    "object([ object, ] [ key-val list, ] key=value, ...) -> object",
                  });
 
-  Builtins::init("has_key", new BuiltinFunction(&builtin_has_key, &Feature::ExperimentalObjectFunction),
+  Builtins::init("has_key", new BuiltinFunction(&builtin_has_key),
                  {
                    "has_key(object, key) -> boolean",
                  });
 
-  Builtins::init("import", new BuiltinFunction(&builtin_import, &Feature::ExperimentalImportFunction),
+  Builtins::init("import", new BuiltinFunction(&builtin_import),
                  {
-                   "import(file) -> object",
+                   "import(file [, type]) -> value",
+                 });
+  Builtins::init("fragments", new BuiltinFunction(&builtin_fragments),
+                 {
+                   "fragments(r|d) -> number",
                  });
 }

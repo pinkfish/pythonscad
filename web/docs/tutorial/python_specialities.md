@@ -8,7 +8,17 @@ To access $fn, $fa, $fs, simply set global fn, fa, fs variable respectively.
 
 ## Import existing files
 
-'import()' cannnot be reused in python-openscad as its a python keyword. use 'osimport()' instead.
+OpenSCAD's `import()` cannot be reused in PythonSCAD because `import` is a
+Python keyword. Use the matching helper for what you are loading:
+
+- Geometry files (STL, 3MF, SVG, …) → [`osimport()`](../reference/io.md#osimport)
+- OpenSCAD libraries (`.scad`) → [`osuse()`](../reference/io.md#osuse)
+- Shared Python libraries → [Libraries](../libraries/index.md) (`pip install` + `import`)
+- Local Python / PythonSCAD scripts → ordinary Python `import`
+- Deprecated remote single-file fetch → [`nimport()`](../reference/io.md#nimport)
+
+See [Choosing an import function](../reference/io.md#choosing-an-import-function)
+for a short comparison.
 
 ## Storing Data with Solids
 

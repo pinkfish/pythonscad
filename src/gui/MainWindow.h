@@ -16,17 +16,18 @@
 #include <QMutex>
 #include <QObject>
 #include <QPoint>
+#include <QPointer>
 #include <QShortcut>
 #include <QSignalMapper>
 #include <QSoundEffect>
 #include <QString>
 #include <QStringList>
-#include <QTemporaryFile>
 #include <QTime>
 #include <QTimer>
 #include <QUrl>
 #include <QWidget>
 #include <ctime>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -44,8 +45,8 @@ Q_IMPORT_PLUGIN(QSvgPlugin)
 #endif
 
 class BuiltinContext;
-class CGALWorker;
 class CSGWorker;
+class GeometryWorker;
 class CSGNode;
 class CSGProducts;
 class FontListDialog;
@@ -118,8 +119,8 @@ public:
 
   Measurement::Measurement meas;
 
-  int compileErrors;
-  int compileWarnings;
+  int compileErrors = 0;
+  int compileWarnings = 0;
 
   MainWindow(const QStringList& filenames);
   std::string loadInitFile(void);
@@ -128,6 +129,8 @@ public:
   ~MainWindow() override;
 
 private:
+  QLabel backend3DLabel;
+
   RubberBandManager rubberBandManager;
 
   std::vector<std::pair<Dock *, QString>> docks;
@@ -157,6 +160,7 @@ private:
   void setupDocks();
   void setupMenusAndActions();
   void restoreWindowState();
+  void restoreToolBarVisibility();
   void openRemainingFiles(const QStringList& filenames);
   /// First CLI path was a missing design file; tab UI deferred until user answers create prompt.
   QString deferredCliMissingFile;
@@ -177,6 +181,7 @@ private slots:
   void openCSGSettingsChanged();
   void consoleOutput(const Message& msgObj);
   void setSelection(int index);
+  void updateBackend3DLabel();
 
   // implements the actions to be done when the selection menu is closing
   // the seclection menu is the one that show up when right click on the geometry in the 3d view.
@@ -214,8 +219,14 @@ public:
   /// Apply persisted top-level window geometry blob (QWidget::saveGeometry payload).
   void applySessionWindowGeometry(const QByteArray& geometry);
 
-  /// Mtime+size fingerprint for auto-reload (empty if path missing or stat fails).
+  /// Write window geometry to the active persistence store (session or QSettings).
+  void persistWindowGeometry();
+
+  /// Millisecond-mtime+size fingerprint for auto-reload (empty if path missing or stat fails).
   static std::string autoReloadIdentityForPath(const QString& filepath);
+  /// True when \a saved and \a current refer to the same on-disk revision, including legacy
+  /// second-precision session fingerprints compared against millisecond identities.
+  static bool autoReloadIdentityMatches(const std::string& saved, const std::string& current);
 
   bool fileChangedOnDisk();
 
@@ -231,9 +242,13 @@ public:
   CSGTreeEvaluator *csgrenderer;
   bool isLightTheme();
   void compileCSG();
+  void cancelRenderForEditor(EditorInterface *editor);
   void compileCSGThread();
   void csgRenderFinished();
   void showFind(bool doFindAndReplace);
+  void setFindState(int state);
+  void refreshFindIndicators();
+  int findState = 0;  // Window-wide search panel state (TabManager::FIND_HIDDEN).
 
 private:
   [[nodiscard]] QString getCurrentFileName() const;
@@ -242,6 +257,12 @@ private:
   void updateCompileResult();
   void compile(bool reload, bool forcedone = false);
   bool checkEditorModified();
+  /// Prompt when Customizer is dirty. \a userInitiatedReload selects File → Reload wording.
+  bool checkParameterSetsModified(bool userInitiatedReload = false);
+  /// Reload companion customizer JSON when its fingerprint changes (prompt if dirty).
+  /// When \a force is true (File → Reload), skip the fingerprint check and reload from disk.
+  /// Returns true when presets were reloaded so the caller can force a recompile.
+  bool maybeReloadCompanionJson(bool force = false);
   QString dumpCSGTree(const std::shared_ptr<AbstractNode>& root);
 
   // Opens an independent windows with a text area showing the text given in argument
@@ -271,6 +292,18 @@ private:
   void addExportActions(QToolBar *toolbar, QAction *action) const;
   QAction *formatIdentifierToAction(const std::string& identifier) const;
   QString getDockBaseName(const QString& title) const;
+  QString exportStartDirectory() const;
+  QString defaultExportBasename() const;
+  QString defaultExportSuffix() const;
+  FileFormatInfo fileFormatInfoFor(FileFormat format) const;
+  bool promptExportOptions(FileFormat format, ExportInfo& exportInfo);
+  bool confirmExportPreconditions();
+  bool confirmExportFormat(FileFormat format);
+  bool writeExportFile(const QString& filename, FileFormat format, ExportInfo& exportInfo);
+  void rememberSuccessfulExport(const QString& filename, FileFormat format,
+                                const ExportInfo& exportInfo);
+  bool runExportAsDialogFlow(bool checkPreconditions = true);
+  bool performRememberedExport(bool checkPreconditions = true);
 
   LibraryInfoDialog *libraryInfoDialog{nullptr};
   FontListDialog *fontListDialog{nullptr};
@@ -307,6 +340,8 @@ private slots:
   void instantiateRoot();
   void compileDone(bool didchange);
   void compileEnded();
+  void resetCompileMessageCounts();
+  void selectPreviewViewMode();
 
 private slots:
   void on_editActionCopyVPT_triggered();
@@ -328,7 +363,9 @@ private slots:
   // Handle the Next/Prev shortcut, currently switch to the targetted dock
   // and adds the rubberband, the rubbreband is removed on shortcut key release.
   void onWindowShortcutNextPrevActivated();
-  void onWindowShortcutExport3DActivated();
+
+  void on_fileActionExport_triggered();
+  void on_fileActionExportAs_triggered();
 
   void onEditorDockVisibilityChanged(bool isVisible);
   void onConsoleDockVisibilityChanged(bool isVisible);
@@ -385,16 +422,29 @@ private slots:
   void on_designShareDesign_triggered();
   void on_designLoadShareDesign_triggered();
   void handleMeasurementClicked(QAction *clickedAction);
+  void findHandleClicked();
   void on_designCheckValidity_triggered();
   void on_designActionDisplayAST_triggered();
   void on_designActionDisplayPython_triggered();
   void on_designActionDisplayCSGTree_triggered();
   void on_designActionDisplayCSGProducts_triggered();
   bool canExport(unsigned int dim);
-  void actionExport(unsigned int dim, ExportInfo& exportInfo);
+  /// Cold start (no rootGeom): offer Render and Export/Print, or cancel.
+  /// Always returns false; leaves pendingAfterRender_ set when a render starts.
+  bool offerColdStartRenderThenContinue();
+  /// Geometry/CSG belongs to another tab: Export/Use other, Render and continue, or Cancel.
+  /// Returns true only if the user chose to proceed with the other tab's data.
+  bool confirmCrossTabGeometryOrRender(EditorInterface *sourceEditor);
+  void actionExport();
+  void actionExportAs();
   void actionExportFileFormat(int fmt);
+  void startRenderThenContinue();
+  void runPendingAfterRender();
+  void clearPendingAfterRender();
   void on_editActionCopyViewport_triggered();
   void on_designActionFlushCaches_triggered();
+  void updateExportMenuText();
+  void updateExportToolbarIcon();
 
 public:
   void viewModeActionsUncheck();
@@ -406,7 +456,6 @@ public:
     setCurrentOutput();
     return sg::make_scope_guard([this] { clearCurrentOutput(); });
   }
-
   bool isEmpty();
 
   void onAxisChanged(InputEventAxisChanged *event) override;
@@ -437,8 +486,9 @@ public slots:
   void jumpToLine(int, int);
   void openFileFromPath(const QString&, int);
   void toolTipShow(QPoint, QString msg);
-  void dragPoint(Vector3d pt, Vector3d newpt);
+  void dragPoint(Vector3d pt, Vector3d newpt, Vector3d dir);
   void dragPointEnd(Vector3d pt);
+  void dragProcess();
 
   void viewModeRender();
 #ifdef ENABLE_OPENCSG
@@ -465,6 +515,7 @@ public slots:
   void viewTogglePerspective();
   void on_viewActionResetView_triggered();
   void on_viewActionViewAll_triggered();
+  void on_viewActionFullScreen_toggled(bool checked);
   void editorContentChanged();
   void leftClick(QPoint coordinate);
   void rightClick(QPoint coordinate);
@@ -502,19 +553,42 @@ private:
 
   char const *afterCompileSlot;
   bool procevents{false};
-  QTemporaryFile *tempFile{nullptr};
   ProgressWidget *progresswidget{nullptr};
-  CGALWorker *cgalworker;
   CSGWorker *csgworker;
+  GeometryWorker *geometryWorker;
   QMutex consolemutex;
   DragResult dragResult;
+  void dragFinish();
+  QTimer *dragTimer{nullptr};
+  bool dragActive{false};         // a drag gesture is in progress
+  bool dragKeepView{false};       // keep old image until the post-drag compile is done
+  bool dragBeginPending{false};   // dragBegin() not yet sent to the node tree
+  bool dragPending{false};        // a mouse position waits to be applied
+  bool dragEndRequested{false};   // mouse released, finish after pending work
+  bool dragLastWasRender{false};  // last compile was F6 (else F5)
+  Vector3d dragPendingPt;
+  Vector3d dragPendingNewPt;
+  Vector3d dragPendingDir;
   EditorInterface *renderedEditor{
-    nullptr};               // stores pointer to editor which has been most recently rendered
+    nullptr};  // stores pointer to editor which has been most recently rendered
+  /// Editor whose F6 geometry is currently in rootGeom (export ownership).
+  EditorInterface *geometrySourceEditor_{nullptr};
+  QPointer<EditorInterface> compilingEditor;
+  std::atomic<bool> renderCancelRequested{false};
   time_t includesMTime{0};  // latest include mod time
   time_t depsMTime{0};      // latest dependency mod time
+  /// Last directory used for any export in this process (not persisted).
+  inline static QString lastExportDirectory;
+  enum class PendingAfterRender { None, Export, ExportAs, Print3D };
+  PendingAfterRender pendingAfterRender_{PendingAfterRender::None};
+  /// Tab that started Render-and-Export/Print; restored before resuming.
+  EditorInterface *pendingAfterRenderEditor_{nullptr};
+  /// Cross-tab geometry ownership acknowledged for the current export action.
+  EditorInterface *approvedGeometrySourceEditor_{nullptr};
+  EditorInterface *approvedGeometryTargetEditor_{nullptr};
   std::unordered_map<QString, QString> exportPaths;  // for each file type, where it was exported to last
-  QString exportPath(
-    const QString& suffix);    // look up the last export path and generate one if not found
+  // look up the last export path and generate one if not found
+  QString exportPath(const QString& suffix, const QString& basename = "");
   int lastParserErrorPos{-1};  // last highlighted error position
   int tabCount = 0;
   ExportPdfPaperSize sizeString2Enum(const QString& current);
@@ -525,7 +599,6 @@ private:
   QMetaObject::Connection editorTrustConnection;
 #endif
   QSoundEffect *renderCompleteSoundEffect;
-  std::vector<std::unique_ptr<QTemporaryFile>> allTempFiles;
 
   void resetMeasurementsState(bool enable, const QString& tooltipMessage);
   QActionGroup *measurementGroup;

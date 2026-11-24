@@ -90,17 +90,33 @@ function Invoke-PythonSCAD {
         $psi.WorkingDirectory = $WorkingDirectory
     }
     $psi.UseShellExecute = $false
+    $psi.Environment['QT_QPA_PLATFORM'] = 'offscreen'
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     if ($InputFile) {
         $psi.RedirectStandardInput = $true
+        $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
     }
 
-    $process = [System.Diagnostics.Process]::Start($psi)
+    # .NET Framework constructs an auto-flushing stdin writer during Start,
+    # using Console.InputEncoding. If it has a BOM, the bytes are already in
+    # the pipe before the caller can access StandardInput. Select BOM-free
+    # UTF-8 while creating that writer, then restore the parent's encoding.
+    $previousInputEncoding = [Console]::InputEncoding
+    try {
+        if ($InputFile) {
+            [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+        }
+        $process = [System.Diagnostics.Process]::Start($psi)
+    } finally {
+        if ($InputFile) {
+            [Console]::InputEncoding = $previousInputEncoding
+        }
+    }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
     if ($InputFile) {
-        $inputText = Get-Content -LiteralPath $InputFile -Raw
+        $inputText = Get-Content -LiteralPath $InputFile -Raw -Encoding UTF8
         $process.StandardInput.Write($inputText)
         $process.StandardInput.Close()
     }
@@ -159,13 +175,33 @@ from pythonscad import *
 
 export(cube(10), "ipython-cube.stl")
 '@
+    Write-Utf8Content -Path (Join-Path $TestDirectory 'pyqt6-smoke.py') -Value @'
+from PyQt6 import QtCore, QtWidgets, sip
+from pythonscad import qapp_ptr
+
+# --repl never starts the GUI, so qapp_ptr() is 0. wrapinstance(0) raises
+# and repl() still exits 0, which used to look like a silent packaging miss.
+# Importing the bundled bindings is the packaging check; wrap the C++ app
+# only when one actually exists.
+ptr = qapp_ptr()
+if ptr:
+    app = sip.wrapinstance(ptr, QtWidgets.QApplication)
+    assert app is not None
+
+marker = "PYQT6_PACKAGED_OK " + QtCore.QT_VERSION_STR
+print(marker, flush=True)
+with open("pyqt6-ok.txt", "w", encoding="utf-8") as fh:
+    fh.write(marker + "\n")
+raise SystemExit(0)
+'@
 }
 
 function Invoke-SmokeTest {
     param(
         [Parameter(Mandatory = $true)][string]$ExecutablePath,
         [Parameter(Mandatory = $true)][string]$Label,
-        [Parameter(Mandatory = $true)][string]$Workdir
+        [Parameter(Mandatory = $true)][string]$Workdir,
+        [switch]$ExpectPyQt6
     )
 
     if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
@@ -201,6 +237,22 @@ function Invoke-SmokeTest {
         -LogFile (Join-Path $testdir 'repl.log')
     Assert-NonEmptyFile -Path (Join-Path $testdir 'repl-cube.stl')
 
+    # Standalone pythonscad-python.exe must register embedded _openscad (issue #1031).
+    $shimPath = Join-Path (Split-Path -Parent $ExecutablePath) 'pythonscad-python.exe'
+    if (Test-Path -LiteralPath $shimPath -PathType Leaf) {
+        Write-SmokeLog "Smoke testing $Label`: pythonscad-python import"
+        $shimScript = Join-Path $testdir 'shim-import.py'
+        @'
+from pythonscad import *
+export(cube(10), "shim-cube.stl")
+'@ | Set-Content -LiteralPath $shimScript -Encoding utf8
+        Invoke-PythonSCAD -ExecutablePath $shimPath `
+            -Arguments @('shim-import.py') `
+            -WorkingDirectory $testdir `
+            -LogFile (Join-Path $testdir 'shim-import.log')
+        Assert-NonEmptyFile -Path (Join-Path $testdir 'shim-cube.stl')
+    }
+
     Write-SmokeLog "Smoke testing $Label`: IPython"
     Invoke-PythonSCAD -ExecutablePath $ExecutablePath `
         -Arguments @('--ipython', 'ipython-smoke.py') `
@@ -208,5 +260,81 @@ function Invoke-SmokeTest {
         -LogFile (Join-Path $testdir 'ipython.log')
     Assert-NonEmptyFile -Path (Join-Path $testdir 'ipython-cube.stl')
 
+    if ($ExpectPyQt6) {
+        Write-SmokeLog "Smoke testing $Label`: packaged PyQt6"
+        $pyqtLog = Join-Path $testdir 'pyqt6.log'
+        $pyqtOk = Join-Path $testdir 'pyqt6-ok.txt'
+        if (Test-Path -LiteralPath $pyqtOk) {
+            Remove-Item -LiteralPath $pyqtOk -Force
+        }
+        Invoke-PythonSCAD -ExecutablePath $ExecutablePath `
+            -Arguments @('--repl') `
+            -WorkingDirectory $testdir `
+            -InputFile (Join-Path $testdir 'pyqt6-smoke.py') `
+            -LogFile $pyqtLog
+        if (-not (Test-Path -LiteralPath $pyqtOk -PathType Leaf) -or ((Get-Item -LiteralPath $pyqtOk).Length -le 0)) {
+            Write-Error "--- begin command output: $pyqtLog ---" -ErrorAction Continue
+            Get-Content -LiteralPath $pyqtLog -Raw -ErrorAction SilentlyContinue | Write-Error -ErrorAction Continue
+            Write-Error "--- end command output: $pyqtLog ---" -ErrorAction Continue
+            throw "$Label`: packaged PyQt6 did not emit its success marker"
+        }
+    }
+
     Write-SmokeLog "Smoke testing $Label`: OK"
+}
+
+function Get-ExpectedSmokeCommit {
+    param([string]$Commit)
+    if (-not $Commit) { $Commit = $env:RELEASE_SMOKE_COMMIT }
+    if (-not $Commit) {
+        $Commit = & git -C (Join-Path $PSScriptRoot '../..') rev-parse HEAD
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot determine checkout commit' }
+    }
+    if ($Commit -notmatch '^[0-9a-fA-F]{40}$') { throw 'Expected a full 40-character source commit SHA' }
+    $Commit
+}
+
+function Assert-SmokeRunCommit {
+    param([string]$Repo, [string]$RunId, [string]$Commit)
+    # Parse JSON in PowerShell to avoid legacy native-argument quoting issues.
+    $runJson = & gh run view $RunId --repo $Repo --json headSha
+    if ($LASTEXITCODE -ne 0) { throw "Failed to query run $RunId" }
+    $actual = ($runJson | ConvertFrom-Json).headSha
+    if ($actual -cne $Commit) { throw "Run $RunId was built from $actual, expected $Commit" }
+}
+
+function Get-LatestSuccessfulRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$Workflow,
+        [string]$Ref,
+        [string]$Commit
+    )
+
+    # Filter through gh itself. Windows PowerShell's native argument passing
+    # strips embedded JSON/jq quotes before gh can see them.
+    $Commit = Get-ExpectedSmokeCommit $Commit
+    $ghArgs = @(
+        'run', 'list',
+        '--repo', $Repo,
+        '--workflow', $Workflow,
+        '--status', 'success',
+        '--commit', $Commit,
+        '--limit', '1',
+        '--json', 'databaseId'
+    )
+    if ($Ref) {
+        $ghArgs += @('--branch', $Ref)
+    }
+    $runJson = & gh @ghArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to query $Workflow runs (gh exit code $LASTEXITCODE)"
+    }
+    $runs = @($runJson | ConvertFrom-Json)
+    if ($runs.Count -eq 0 -or -not $runs[0].databaseId) {
+        throw "No successful $Workflow run found for commit $Commit (ref '$Ref'); trigger fresh release builds"
+    }
+    $runId = [string]$runs[0].databaseId
+    Assert-SmokeRunCommit -Repo $Repo -RunId $runId -Commit $Commit
+    $runId
 }

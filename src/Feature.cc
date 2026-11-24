@@ -30,20 +30,12 @@ const Feature Feature::ExperimentalInputDriverDBus("input-driver-dbus",
                                                    "Enable DBus input drivers (requires restart)");
 const Feature Feature::ExperimentalSkin("skin", "Enable skin() and some extra related changes");
 const Feature Feature::ExperimentalLazyUnion("lazy-union", "Enable lazy unions.");
+const Feature Feature::ExperimentalPythonSeparateObjects(
+  "python-separate-objects",
+  "Keep objects passed to Python <code>show()</code> as separate top-level objects instead of "
+  "unioning them, so 3MF export can write one object per part.");
 const Feature Feature::ExperimentalVxORenderersIndexing("vertex-object-renderers-indexing",
                                                         "Enable indexing in vertex object renderers");
-const Feature Feature::ExperimentalTextMetricsFunctions(
-  "textmetrics", "Enable the <code>textmetrics()</code> and <code>fontmetrics()</code> functions.");
-const Feature Feature::ExperimentalImportFunction(
-  "import-function", "Enable import function returning data instead of geometry.");
-const Feature Feature::ExperimentalObjectFunction(
-  "object-function", "Enable object function to allow user creation of objects.");
-const Feature Feature::ExperimentalPredictibleOutput(
-  "predictible-output",
-  "Attempt to produce predictible, diffable outputs (e.g. sorting the STL, or remeshing in a determined "
-  "order)");
-const Feature Feature::ExperimentalWrapPolygon("wrap-polygon",
-                                               "New Wrap feature which can wrap shapes around polygon");
 const Feature Feature::ExperimentalVectorSwizzle(
   "vector-swizzle", "Enable vector swizzling (e.g. <code>vec4.zyx</code> to reverse a 3D vector).");
 const Feature Feature::ExperimentalDiscretizationByError(

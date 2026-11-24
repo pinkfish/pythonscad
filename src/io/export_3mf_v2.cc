@@ -35,7 +35,6 @@
 #include <unordered_map>
 #include <utility>
 
-#include "Feature.h"
 #include "core/ColorUtil.h"
 #include "export_enums.h"
 #include "geometry/Geometry.h"
@@ -139,7 +138,7 @@ void handle_triangle_color(const std::shared_ptr<const PolySet>& ps, ExportConte
     return;
   }
 
-  const Color4f col = ps->colors[color_index];
+  const Color4f col = ps->colors[color_index].resolved(ctx.selectedColor, ctx.info.defaultCutoutColor());
   const auto col_it = ctx.materialColors.find(col);
 
   Lib3MF_uint32 col_idx = 0;
@@ -220,10 +219,7 @@ bool append_polyset(const std::shared_ptr<const PolySet>& ps, const Export3mfPar
       return true;
     };
 
-    std::shared_ptr<const PolySet> out_ps = ps;
-    if (Feature::ExperimentalPredictibleOutput.is_enabled()) {
-      out_ps = createSortedPolySet(*ps);
-    }
+    auto out_ps = createSortedPolySet(*ps);
 
     for (const auto& v : out_ps->vertices) {
       if (!vertexFunc(v)) {
@@ -233,8 +229,13 @@ bool append_polyset(const std::shared_ptr<const PolySet>& ps, const Export3mfPar
     }
 
     for (size_t i = 0; i < out_ps->indices.size(); i++) {
+      const auto& poly = out_ps->indices[i];
+      // lib3mf rejects a triangle whose vertex indices are not unique.
+      if (poly.size() < 3 || poly[0] == poly[1] || poly[1] == poly[2] || poly[0] == poly[2]) {
+        continue;
+      }
       auto color_index = i < out_ps->color_indices.size() ? out_ps->color_indices[i] : -1;
-      if (!triangleFunc(out_ps->indices[i], color_index)) {
+      if (!triangleFunc(poly, color_index)) {
         export_3mf_error("Can't add triangle to 3MF model.");
         return false;
       }

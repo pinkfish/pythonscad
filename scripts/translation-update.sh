@@ -36,6 +36,7 @@ updatepot()
  OPTS=$OPTS' --package-version='$VER
  OPTS=$OPTS' --default-domain=openscad'
  OPTS=$OPTS' --language=c++'
+ OPTS=$OPTS' --from-code=UTF-8'
  OPTS=$OPTS' --keyword=' #without WORD means not to use default keywords
  OPTS=$OPTS' --keyword=_'
  OPTS=$OPTS' --keyword=q_'
@@ -82,7 +83,7 @@ updatemo()
   for LANGCODE in `cat locale/LINGUAS | grep -v "#"`; do
     mkdir -p ./locale/$LANGCODE/LC_MESSAGES
     OPTS='-c -v'
-    cmd="$GETTEXT_PATH"'msgfmt '$OPTS' -o ./locale/'$LANGCODE'/LC_MESSAGES/pythonscad.mo ./locale/'$LANGCODE'.po'
+    cmd="$GETTEXT_PATH"'msgfmt '$OPTS' -o ./locale/'$LANGCODE'/LC_MESSAGES/openscad.mo ./locale/'$LANGCODE'.po'
     echo $cmd
     $cmd
     if [ ! $? = 0 ]; then
@@ -94,7 +95,7 @@ updatemo()
   if which itstool > /dev/null 2>&1; then
     # ugly workaround for bug https://bugs.freedesktop.org/show_bug.cgi?id=90937
     for LANGCODE in `cat locale/LINGUAS | grep -v "#"`; do
-      ln -s pythonscad.mo ./locale/$LANGCODE/LC_MESSAGES/$LANGCODE.mo
+      ln -sfn openscad.mo ./locale/$LANGCODE/LC_MESSAGES/$LANGCODE.mo
     done
 
     # generate translated appdata file
@@ -125,11 +126,19 @@ cd "$TOPDIR" || exit 1
 if [ -z ${1+x} ]; then
   CURDIR="`python3 -c "import os; print(os.path.relpath(os.path.realpath('$BASEDIR'), '$TOPDIR'))"`"
   echo "Generating POTFILES..."
-  BUILDDIR=$(
+  # Prefer ./build when present so stale sibling trees (e.g. build-sandbox-check)
+  # cannot contaminate the catalog with outdated ui_*.h strings.
+  if [ -f "$CURDIR/build/OpenSCADLibInternal_autogen/include/ui_MainWindow.h" ] || \
+     [ -f "$CURDIR/build/OpenSCAD_autogen/include/ui_MainWindow.h" ]; then
+    BUILDDIR="$CURDIR/build"
+  else
+    BUILDDIR=$(
 	find "$CURDIR" -name ui_MainWindow.h \
 	| grep 'OpenSCAD.*_autogen/include/ui_MainWindow.h' \
-	| sed -e 's,/*OpenSCAD.*_autogen/include/ui_MainWindow.h,,'
-  )
+	| sed -e 's,/*OpenSCAD.*_autogen/include/ui_MainWindow.h,,' \
+	| head -n1
+    )
+  fi
   echo "Found directory: $BUILDDIR"
   ./scripts/generate-potfiles.sh "$BUILDDIR" > locale/POTFILES
   updatepot && updatepo && updatemo

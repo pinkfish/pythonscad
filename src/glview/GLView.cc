@@ -23,6 +23,69 @@
 #include <python_public.h>
 #endif
 
+namespace {
+
+void local_gluPerspective(GLdouble fovy, GLdouble aspect, GLdouble zNear, GLdouble zFar)
+{
+  GLdouble ymax = zNear * tan_degrees(fovy / 2.0);
+  GLdouble ymin = -ymax;
+  GLdouble xmin = ymin * aspect;
+  GLdouble xmax = ymax * aspect;
+  glFrustum(xmin, xmax, ymin, ymax, zNear, zFar);
+}
+
+void local_gluLookAt(GLdouble eyeX, GLdouble eyeY, GLdouble eyeZ, GLdouble centerX, GLdouble centerY,
+                     GLdouble centerZ, GLdouble upX, GLdouble upY, GLdouble upZ)
+{
+  double fx = centerX - eyeX;
+  double fy = centerY - eyeY;
+  double fz = centerZ - eyeZ;
+  double rlf = 1.0 / std::sqrt(fx * fx + fy * fy + fz * fz);
+  fx *= rlf;
+  fy *= rlf;
+  fz *= rlf;
+
+  double sx = fy * upZ - fz * upY;
+  double sy = fz * upX - fx * upZ;
+  double sz = fx * upY - fy * upX;
+  double rls = 1.0 / std::sqrt(sx * sx + sy * sy + sz * sz);
+  sx *= rls;
+  sy *= rls;
+  sz *= rls;
+
+  double ux = sy * fz - sz * fy;
+  double uy = sz * fx - sx * fz;
+  double uz = sx * fy - sy * fx;
+
+  GLdouble m[16] = {sx, ux, -fx, 0.0, sy, uy, -fy, 0.0, sz, uz, -fz, 0.0, 0.0, 0.0, 0.0, 1.0};
+  glMultMatrixd(m);
+  glTranslated(-eyeX, -eyeY, -eyeZ);
+}
+
+GLint local_gluProject(GLdouble objx, GLdouble objy, GLdouble objz, const GLdouble model[16],
+                       const GLdouble proj[16], const GLint viewport[4], GLdouble *winx, GLdouble *winy,
+                       GLdouble *winz)
+{
+  double in[4] = {objx, objy, objz, 1.0};
+  double out[4];
+  for (int i = 0; i < 4; ++i) {
+    out[i] = in[0] * model[i] + in[1] * model[4 + i] + in[2] * model[8 + i] + in[3] * model[12 + i];
+  }
+  for (int i = 0; i < 4; ++i) {
+    in[i] = out[0] * proj[i] + out[1] * proj[4 + i] + out[2] * proj[8 + i] + out[3] * proj[12 + i];
+  }
+  if (in[3] == 0.0) return GL_FALSE;
+  in[0] /= in[3];
+  in[1] /= in[3];
+  in[2] /= in[3];
+  *winx = viewport[0] + (1.0 + in[0]) * viewport[2] / 2.0;
+  *winy = viewport[1] + (1.0 + in[1]) * viewport[3] / 2.0;
+  *winz = (1.0 + in[2]) / 2.0;
+  return GL_TRUE;
+}
+
+}  // namespace
+
 GLView::GLView()
 {
   aspectratio = 1;
@@ -132,7 +195,7 @@ void GLView::setupCamera()
   auto dist = cam.zoomValue();
   switch (this->cam.projection) {
   case Camera::ProjectionType::PERSPECTIVE: {
-    gluPerspective(cam.fov, aspectratio, 0.1 * dist, 100 * dist);
+    local_gluPerspective(cam.fov, aspectratio, 0.1 * dist, 100 * dist);
     break;
   }
   default:
@@ -144,9 +207,9 @@ void GLView::setupCamera()
   }
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
-  gluLookAt(0.0, -dist, 0.0,  // eye
-            0.0, 0.0, 0.0,    // center
-            0.0, 0.0, 1.0);   // up
+  local_gluLookAt(0.0, -dist, 0.0,  // eye
+                  0.0, 0.0, 0.0,    // center
+                  0.0, 0.0, 1.0);   // up
 
   glRotated(cam.object_rot.x(), 1.0, 0.0, 0.0);
   glRotated(cam.object_rot.y(), 0.0, 1.0, 0.0);
@@ -208,9 +271,7 @@ void GLView::paintGL()
   glLineWidth(2);
   glColor3d(1.0, 0.0, 0.0);
 
-  glColor3f(0, 1, 0);
   Vector3d eyedir(this->modelview[2], this->modelview[6], this->modelview[10]);
-  if (shown_obj != nullptr) showObject(*shown_obj, eyedir);
 #ifdef ENABLE_PYTHON
   if (this->handle_mode) {
     glColor3f(0, 0, 1);
@@ -236,6 +297,18 @@ void GLView::paintGL()
   glColor3f(1, 0, 0);
   for (const SelectedObject& obj : this->selected_obj) {
     showObject(obj, eyedir);
+  }
+  // Draw the hovered/dragged markers last and without depth test: they sit exactly
+  // on a vertex of the model and were hidden or z-fighting ("blinking") before.
+  if (shown_obj != nullptr || drag_obj != nullptr) {
+    glDisable(GL_DEPTH_TEST);
+    glColor3f(0, 1, 0);  // measurement hover marker
+    if (shown_obj != nullptr) showObject(*shown_obj, eyedir);
+    // Drag handle: azure blue. Clearly differs from the measurement green, the
+    // red selection and from the yellow/green model colors of the default schemes.
+    glColor3f(0.0f, 0.6f, 1.0f);
+    if (drag_obj != nullptr) showObject(*drag_obj, eyedir);
+    glEnable(GL_DEPTH_TEST);
   }
   glDisable(GL_LIGHTING);
   if (showaxes) GLView::showSmallaxes(axescolor);
@@ -346,6 +419,10 @@ void GLView::initializeGL()
 
 void GLView::showSmallaxes(const Color4f& col)
 {
+  double axisLength = 10;
+  double labelPosition = 13;
+  double labelSize = 8;
+
   auto dpi = this->getDPI();
   // Small axis cross in the lower left corner
   glDepthFunc(GL_ALWAYS);
@@ -357,9 +434,9 @@ void GLView::showSmallaxes(const Color4f& col)
   auto scale = 90.0;
   glOrtho(-scale * dpi * aspectratio, scale * dpi * aspectratio, -scale * dpi, scale * dpi, -scale * dpi,
           scale * dpi);
-  gluLookAt(0.0, -1.0, 0.0,  // eye
-            0.0, 0.0, 0.0,   // center
-            0.0, 0.0, 1.0);  // up
+  local_gluLookAt(0.0, -1.0, 0.0,  // eye
+                  0.0, 0.0, 0.0,   // center
+                  0.0, 0.0, 1.0);  // up
 
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
@@ -371,13 +448,13 @@ void GLView::showSmallaxes(const Color4f& col)
   glBegin(GL_LINES);
   glColor3d(1.0, 0.0, 0.0);
   glVertex3d(0, 0, 0);
-  glVertex3d(10 * dpi, 0, 0);
+  glVertex3d(axisLength * dpi, 0, 0);
   glColor3d(0.0, 1.0, 0.0);
   glVertex3d(0, 0, 0);
-  glVertex3d(0, 10 * dpi, 0);
+  glVertex3d(0, axisLength * dpi, 0);
   glColor3d(0.0, 0.0, 1.0);
   glVertex3d(0, 0, 0);
-  glVertex3d(0, 0, 10 * dpi);
+  glVertex3d(0, 0, axisLength * dpi);
   glEnd();
 
   GLdouble mat_model[16];
@@ -390,17 +467,20 @@ void GLView::showSmallaxes(const Color4f& col)
   glGetIntegerv(GL_VIEWPORT, viewport);
 
   GLdouble xlabel_x, xlabel_y, xlabel_z;
-  gluProject(12 * dpi, 0, 0, mat_model, mat_proj, viewport, &xlabel_x, &xlabel_y, &xlabel_z);
+  local_gluProject(labelPosition * dpi, 0, 0, mat_model, mat_proj, viewport, &xlabel_x, &xlabel_y,
+                   &xlabel_z);
   xlabel_x = std::round(xlabel_x);
   xlabel_y = std::round(xlabel_y);
 
   GLdouble ylabel_x, ylabel_y, ylabel_z;
-  gluProject(0, 12 * dpi, 0, mat_model, mat_proj, viewport, &ylabel_x, &ylabel_y, &ylabel_z);
+  local_gluProject(0, labelPosition * dpi, 0, mat_model, mat_proj, viewport, &ylabel_x, &ylabel_y,
+                   &ylabel_z);
   ylabel_x = std::round(ylabel_x);
   ylabel_y = std::round(ylabel_y);
 
   GLdouble zlabel_x, zlabel_y, zlabel_z;
-  gluProject(0, 0, 12 * dpi, mat_model, mat_proj, viewport, &zlabel_x, &zlabel_y, &zlabel_z);
+  local_gluProject(0, 0, labelPosition * dpi, mat_model, mat_proj, viewport, &zlabel_x, &zlabel_y,
+                   &zlabel_z);
   zlabel_x = std::round(zlabel_x);
   zlabel_y = std::round(zlabel_y);
 
@@ -414,7 +494,7 @@ void GLView::showSmallaxes(const Color4f& col)
 
   glColor3f(col.r(), col.g(), col.b());
 
-  float d = 3 * dpi;
+  float d = labelSize * dpi / 2;
   glBegin(GL_LINES);
   // X Label
   glVertex3d(xlabel_x - d, xlabel_y - d, 0);
@@ -422,9 +502,11 @@ void GLView::showSmallaxes(const Color4f& col)
   glVertex3d(xlabel_x - d, xlabel_y + d, 0);
   glVertex3d(xlabel_x + d, xlabel_y - d, 0);
   // Y Label
-  glVertex3d(ylabel_x - d, ylabel_y - d, 0);
-  glVertex3d(ylabel_x + d, ylabel_y + d, 0);
+  glVertex3d(ylabel_x, ylabel_y - d, 0);
+  glVertex3d(ylabel_x, ylabel_y, 0);
   glVertex3d(ylabel_x - d, ylabel_y + d, 0);
+  glVertex3d(ylabel_x, ylabel_y, 0);
+  glVertex3d(ylabel_x + d, ylabel_y + d, 0);
   glVertex3d(ylabel_x, ylabel_y, 0);
   // Z Label
   glVertex3d(zlabel_x - d, zlabel_y - d, 0);

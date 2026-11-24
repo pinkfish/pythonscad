@@ -37,11 +37,20 @@ Passing a list of solids implicitly creates a union.
     show([cube(5).right(5 * i) for i in range(5)])
     ```
 
+!!! warning "Deprecated: `output()`"
+    `output()` / `obj.output()` is a deprecated alias for `show()` /
+    `obj.show()`. Prefer `show()` in new code.
+
 ---
 
 ## export
 
-Export an object to a file. Supports STL, 3MF, OFF, AMF, and other formats based on the file extension.
+Export an object to a file. Supports STL, 3MF, OFF, and other formats based on the file extension.
+
+`export()` writes the file only when `preview` is false: F6 in the GUI,
+CLI `--render`, or a CLI mesh `-o` format such as STL/3MF. During F5
+preview (and CLI echo/PNG without `--render`) it is a no-op, so use
+`show()` for the viewport.
 
 **Syntax:**
 
@@ -91,7 +100,7 @@ entry, all packed into the output file:
 * **3MF only.** For non-3MF extensions, dict values that aren't
   recognised as solids are filtered first; `TypeError: This Format
   can at most export one object` is raised only when more than one
-  recognised value remains. STL / OFF / AMF / etc. therefore still
+  recognised value remains. STL / OFF / etc. therefore still
   work for a dict that yields zero or one recognised value after
   filtering.
 * **`dict` only (including `dict` subclasses).** Mapping types that
@@ -158,8 +167,8 @@ Project a 3D object onto the XY plane, producing a 2D shape.
 === "Python"
 
     ```python
-    projection(obj, cut=False, convexity=2)
-    obj.projection(cut=False, convexity=2)
+    projection(obj, cut=False, detail=False, convexity=2)
+    obj.projection(cut=False, detail=False, convexity=2)
     ```
 
 **Parameters:**
@@ -168,7 +177,7 @@ Project a 3D object onto the XY plane, producing a 2D shape.
 |-----------|------|---------|-------------|
 | `obj` | solid | — | 3D object to project |
 | `cut` | bool | `False` | If `True`, only the cross-section at Z=0 is returned; if `False`, the entire silhouette is projected |
-| `detail` | bool | `False` | If `True`, preserves all the edges during creating  the projection, only valid when cut is False |
+| `detail` | bool | `False` | If `True` and `cut` is `False`, preserve more silhouette edges. Only honored with the Manifold backend; ignored otherwise |
 | `convexity` | int | `2` | Convexity for rendering |
 
 **Examples:**

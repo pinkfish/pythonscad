@@ -21,12 +21,20 @@ extern AssignmentList customizer_parameters_finished;
 extern std::shared_ptr<RenderVariables> renderVarsSet;
 void python_export_obj_att(std::ostream& output);
 std::string python_version(void);
+std::string editorGetCallArgs(int pos);
+void editorReplaceCallArgs(int pos, const char *newText);
 
 void initPython(const std::string& binDir, const std::string& scriptpath, const RenderVariables *r);
 std::string evaluatePython(const std::string& code, bool dry_run = false);
 void finishPython();
+void snapshotPythonInventory();
+bool python_call_named_bool(const std::string& name, const std::string& arg);
+bool python_get_static_calltip(const std::string& className, std::string& result);
+bool python_call_static_editor_method(const std::string& className, const std::string& methodName,
+                                      int position);
 void python_lock(void);
 void python_unlock(void);
+const char *python_calltip(const char *funcname);
 // Launch the real IPython interactive shell. `args` is forwarded as the
 // IPython argv (so `pythonscad --ipython script.py arg1` runs `script.py`
 // inside IPython with `arg1` available). The user namespace starts
@@ -57,12 +65,15 @@ Outline2d python_getprofile(void *v_cbfunc, int fn, double arg);
 extern bool pythonMainModuleInitialized;
 extern bool pythonRuntimeInitialized;
 extern bool pythonDryRun;
+extern bool pythonPreview;
 extern std::shared_ptr<AbstractNode> genlang_result_node;
 extern std::vector<SelectedObject> python_result_handle;
 extern std::string commandline_commands;
 
 int pythonRunArgs(int argc, char **argv);
 int pythonCreateVenv(const std::string& path);
+std::vector<std::string> pythonCreateVenvArgs(const std::string& path);
+int pythonFinishVenv(const std::string& path);
 int pythonRunModule(const std::string& appPath, const std::string& module,
                     const std::vector<std::string>& args);
 std::string pythonShimExecutablePath();

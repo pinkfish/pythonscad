@@ -52,10 +52,13 @@ option(HEADLESS "Build without GUI frontend" OFF)
 option(USE_QT6 "Build the GUI with Qt6" ON)
 option(ENABLE_EGL "Enable EGL support if available" ON)
 option(ENABLE_GLX "Enable GLX support if available" ON)
+option(ENABLE_OSMESA "Enable OSMesa support if available" OFF)
+option(NULLGL "Build without OpenGL, (implies HEADLESS=ON) " OFF)
+
+set(DEFAULT_OFFSCREEN_CONTEXT "" CACHE STRING "Default offscreen OpenGL context provider (cgl, osmesa, egl, glx, wgl-old, nullgl)")
 # For now, we'll default to whatever OpenCSG uses (>=1.6 -> GLAD, <1.6 -> GLEW)
 option(USE_GLAD "Use GLAD. Mutually exclusive from USE_GLEW" OFF)
 option(USE_GLEW "Use GLEW. Mutually exclusive from USE_GLAD" OFF)
-option(NULLGL "Build without OpenGL, (implies HEADLESS=ON) " OFF)
 option(IDPREFIX "Prefix CSG nodes with index # (debugging purposes only, will break node cache)" OFF)
 option(PROFILE "Enable compiling with profiling / test coverage instrumentation" OFF)
 option(MXECROSS "Enable setup for MXE cross platform build" OFF)
@@ -63,6 +66,12 @@ option(OFFLINE_DOCS "Download Documentation for offline usage" OFF)
 option(USE_MIMALLOC "Use mimalloc as malloc replacement." ON)
 option(USE_BUILTIN_OPENCSG "Use OpenCSG from submodule." OFF)
 option(USE_CCACHE "Use ccache to speed up compilation." ON)
+
+if(APPLE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$" OR CMAKE_OSX_ARCHITECTURES MATCHES "(^|;)arm64($|;)"))
+  set(USE_MIMALLOC OFF CACHE BOOL "Use mimalloc as malloc replacement." FORCE)
+  message(STATUS "Disabling mimalloc for arm64 macOS target")
+endif()
+
 set(ENABLE_CAIRO "AUTO" CACHE STRING "Enable support for cairo vector graphics library")
 set_property(CACHE ENABLE_CAIRO PROPERTY STRINGS "AUTO" "ON" "OFF")
 
@@ -87,12 +96,12 @@ cmake_dependent_option(ENABLE_QTDBUS "Enable DBus input driver for Qt." ON "NOT 
 set(ENABLE_GAMEPAD "AUTO" CACHE STRING "Enable Qt5Gamepad input driver")
 set_property(CACHE ENABLE_GAMEPAD PROPERTY STRINGS "AUTO" "ON" "OFF")
 set(WASM_BUILD_TYPE "web" CACHE STRING
-  "WebAssembly build type. Support web (builds an OpenSCAD module) or node (standalone .js executable)")
+  "WebAssembly build type. Support web (builds an OpenSCAD module), node (standalone .js executable) or node-module (ES module for node)")
 
 if (USE_QT6)
-  # Minimum version required for PythonSCAD: macOS 14.0 (Sonoma)
-  # Only currently Apple-supported macOS versions are targeted.
-  set(DEPLOYMENT_TARGET "14.0")
+  # Minimum version required for PythonSCAD: macOS 15.0 (Sequoia).
+  # Oldest OS still fully supported by Apple, Homebrew, and GitHub Actions.
+  set(DEPLOYMENT_TARGET "15.0")
 else()
   # Minimum version required for std::filesystem
   set(DEPLOYMENT_TARGET "10.15")
@@ -100,6 +109,11 @@ endif()
 
 # Note: CMAKE_OSX_DEPLOYMENT_TARGET must be set before the project() invocation
 set(CMAKE_OSX_DEPLOYMENT_TARGET ${DEPLOYMENT_TARGET} CACHE STRING "Minimum OS X deployment version")
+
+# Default ON so later targets (OpenSCADPy, tests, …) appear in
+# compile_commands.json. No FORCE: -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF wins.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
+  "Generate compile_commands.json for clangd/clang-tidy")
 
 project(OpenSCAD
   VERSION ${PROJECT_VERSION}
@@ -149,6 +163,15 @@ set_target_properties(OpenSCADLibInternal PROPERTIES
 )
 
 add_library(svg STATIC)
+# Disable floating-point contraction (fusing a*b+c into a single fma) for the SVG code.
+# arm64 has FMA in its baseline ISA and Clang fuses by default; the x86-64 baseline has no
+# FMA instruction, so the same expressions round at every step. path::arc_to() feeds its
+# results into a ceil() that picks the arc's segment count, so a sub-ulp difference there
+# changes the number of segments and hence every emitted coordinate.
+# See https://github.com/openscad/openscad/issues/6161.
+if(NOT MSVC)
+  target_compile_options(svg PRIVATE -ffp-contract=off)
+endif()
 target_link_libraries(OpenSCADExe PUBLIC svg)
 # TODO: https://github.com/openscad/openscad/issues/6369 - Update includes so we don't need this, which also prevents trivially including other parts of OpenSCAD.
 target_include_directories(svg PUBLIC
@@ -304,6 +327,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL Emscripten)
   set(Boost_USE_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
   set(ENABLE_CAIRO OFF CACHE BOOL "" FORCE)
   set(MANIFOLD_PAR OFF CACHE BOOL "" FORCE)
+  set(USE_MANIFOLD_MINKOWSKI ON CACHE BOOL "" FORCE)
   set(NULLGL ON CACHE BOOL "" FORCE)
   set(USE_MIMALLOC OFF CACHE BOOL "" FORCE)
   set(ENABLE_LIBFIVE OFF CACHE BOOL "" FORCE)
@@ -425,8 +449,22 @@ if (typeof process !== 'undefined' && process.on) {
       POST_BUILD TARGET OpenSCADExe
       COMMAND ${CMAKE_COMMAND} "-DFILE=$<TARGET_FILE:OpenSCADExe>" -P "${CMAKE_CURRENT_BINARY_DIR}/prepend_node_shebang.cmake"
     )
+  elseif (WASM_BUILD_TYPE STREQUAL "node-module")
+    target_link_options(OpenSCADExe PUBLIC
+      -sENVIRONMENT=node,worker
+      -sEXPORT_ES6=1
+      -sEXPORT_NAME=OpenSCAD
+      -sMODULARIZE=1
+      -sNODERAWFS
+
+      # Single .js (more elegant for CLI release) is larger than separate .js & .wasm (preferred for web)
+      $<$<CONFIG:Release>:-sSINGLE_FILE>
+
+      # Alternatively to single-file mode, code caching could make repeated runs faster:
+      # -sNODE_CODE_CACHING -sWASM_ASYNC_COMPILATION=0
+    )
   else()
-    message(FATAL_ERROR "Invalid WASM_BUILD_TYPE: ${WASM_BUILD_TYPE} (allowed: node, web)")
+    message(FATAL_ERROR "Invalid WASM_BUILD_TYPE: ${WASM_BUILD_TYPE} (allowed: node, node-module, web)")
   endif()
 endif()
 
@@ -504,6 +542,9 @@ macro(find_graphics)
 
     set(OPENSCAD_UNITY_BUILD ${CMAKE_UNITY_BUILD})
     set(CMAKE_UNITY_BUILD OFF)
+    if(APPLE AND ENABLE_OSMESA)
+      set(USE_BUILTIN_OPENCSG ON)
+    endif()
     if(NOT USE_BUILTIN_OPENCSG)
       find_package(OpenCSG REQUIRED QUIET)
       target_link_libraries(OpenSCADLibInternal PUBLIC ${OPENCSG_LIBRARY})
@@ -547,7 +588,7 @@ macro(find_graphics)
       set(GLEW_SOURCES src/glview/glew-utils.cc)
     endif()
 
-    find_package(OpenGL REQUIRED QUIET)
+    find_package(OpenGL QUIET REQUIRED OpenGL)
     target_link_libraries(OpenSCADLibInternal PUBLIC ${OPENGL_LIBRARIES})
     message(STATUS "OpenGL: ${OPENGL_LIBRARIES}")
   endif()
@@ -627,6 +668,7 @@ else()
 
   find_package(FontConfig 2.8.0 REQUIRED)
   message(STATUS "Fontconfig: ${FONTCONFIG_VERSION}")
+  target_include_directories(OpenSCADLibInternal SYSTEM PUBLIC ${FONTCONFIG_INCLUDE_DIR})
   target_link_libraries(OpenSCADLibInternal PUBLIC ${FONTCONFIG_LIBRARIES})
 
   find_package(GLIB2 2.26 REQUIRED)
@@ -734,12 +776,15 @@ if(ENABLE_PYTHON)
     src/python/py_analysis.cc
     src/python/py_ops.cc
     src/python/py_io.cc
+    src/python/pywidget_bridge.cc
     src/python/pyconversion.cc
     src/python/python_runtime.cc
+    src/geometry/patch.cc
     src/core/node_clone.cc
     src/core/PullNode.cc
     src/core/WrapNode.cc
     src/core/SheetNode.cc
+    src/core/PatchNode.cc
     src/core/DebugNode.cc
     src/core/RepairNode.cc
     src/core/OversampleNode.cc
@@ -867,18 +912,16 @@ if(ENABLE_PYTHON)
       SET(PYTHON_MINGW_ARCHIVE "${PYTHON_MINGW_DEVPATH}/${CALLSTACK}64/lib/libpython${PYTHON_MINGW_VERSION}.dll.a")
       SET(PYTHON_MINGW_INCLUDE "/${CALLSTACK}64/include/python${PYTHON_MINGW_VERSION}")
 
-      # Copy MSYS2 Python to local directory for patching
-      # Use bash to ensure Unix commands work in MSYS2 environment
+      # Copy MSYS2 Python headers. The import library is generated from the
+      # embeddable DLL once that archive has been downloaded.
       add_custom_command(
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/prepare-msys2-python.sh
                 "${CALLSTACK}"
                 "${PYTHON_MINGW_VERSION}"
                 "${PYTHON_MINGW_DEVPATH}"
-        OUTPUT ${PYTHON_MINGW_ARCHIVE}
+        OUTPUT ${PYTHON_MINGW_DEVPATH}/.headers-ready
       )
-      add_custom_target(tgt_python_mingw DEPENDS ${PYTHON_MINGW_ARCHIVE})
-      add_dependencies(OpenSCADPy tgt_python_mingw)
 
       # Get the full Python version for embed downloads (e.g., 3.13.2)
       # Check if PYTHON_FULL_VERSION env var is set (from CI), otherwise try to detect
@@ -916,6 +959,21 @@ if(ENABLE_PYTHON)
     add_custom_target(tgt_python_embed DEPENDS ${PYTHON_EMBED_SHLIB})
     add_dependencies(OpenSCADPy tgt_python_embed)
 
+    if(NOT MXECROSS)
+      # Import library for the DLL this build ships (python3XY.dll), not for
+      # MSYS2's libpython3.X.dll.
+      add_custom_command(
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/libpython_patch.sh
+                "${PYTHON_EMBED_SHLIB}"
+                "${PYTHON_MINGW_ARCHIVE}"
+        DEPENDS ${PYTHON_EMBED_SHLIB} ${PYTHON_MINGW_DEVPATH}/.headers-ready
+        OUTPUT ${PYTHON_MINGW_ARCHIVE}
+      )
+      add_custom_target(tgt_python_mingw DEPENDS ${PYTHON_MINGW_ARCHIVE})
+      add_dependencies(OpenSCADPy tgt_python_mingw)
+    endif()
+
     target_include_directories(OpenSCADPy SYSTEM PRIVATE "${PYTHON_MINGW_DEVPATH}/${CALLSTACK}64/include/python${PYTHON_MINGW_VERSION}")
     target_link_libraries(OpenSCADPy PRIVATE "${PYTHON_MINGW_ARCHIVE}")
     target_include_directories(OpenSCADPy SYSTEM PRIVATE ${HARFBUZZ_INCLUDE_DIRS})
@@ -923,7 +981,7 @@ if(ENABLE_PYTHON)
     target_include_directories(OpenSCADPy PRIVATE "${CMAKE_SOURCE_DIR}/submodules/Clipper2/CPP/Clipper2Lib/include")
   else() #MXE
     if (CMAKE_SYSTEM_NAME STREQUAL Emscripten)
-      # WASM cross-compile: use pre-built CPython artifacts from Dockerfile.wasm-python-base.
+      # WASM cross-compile: use CPython artifacts from the published toolchain image.
       # find_package(Python3) cannot run the target interpreter, so we set paths directly.
       # Nettle is GUI-only; HEADLESS=ON (forced by NULLGL) excludes that code path.
       set(Python_Eff_LIBRARIES "${CPYTHON_WASM_PREFIX}/lib/libpython${CPYTHON_WASM_PYVER}.a")
@@ -1023,6 +1081,7 @@ if(ENABLE_PYTHON)
   set_property(TARGET OpenSCADPy PROPERTY CXX_STANDARD 17)
   set_property(TARGET OpenSCADPy PROPERTY CXX_EXTENSIONS OFF)
   set_property(TARGET OpenSCADPy PROPERTY CXX_STANDARD_REQUIRED ON)
+  set_property(TARGET OpenSCADPy PROPERTY EXPORT_COMPILE_COMMANDS ON)
   target_compile_definitions(OpenSCADPy PRIVATE "STACKSIZE=${STACKSIZE}")
   target_compile_options(OpenSCADPy PRIVATE "$<$<CONFIG:DEBUG>:-DDEBUG>")
   target_compile_definitions(OpenSCADPy PRIVATE
@@ -1272,8 +1331,17 @@ BISON_TARGET(comment_parser src/core/customizer/comment_parser.y ${OPENSCAD_LIB_
 ADD_FLEX_BISON_DEPENDENCY(comment_lexer comment_parser)
 
 if(NOT HEADLESS)
+  if(APPLE AND USE_QT6 AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/macos-pyqt6-qt/prefix")
+    file(STRINGS "${CMAKE_SOURCE_DIR}/third_party/macos-pyqt6-qt/prefix" PYQT6_QT_PREFIX LIMIT_COUNT 1)
+    if(EXISTS "${PYQT6_QT_PREFIX}")
+      list(PREPEND CMAKE_PREFIX_PATH "${PYQT6_QT_PREFIX}")
+    endif()
+  endif()
   if (APPLE AND EXISTS /usr/local/opt/qt)
     list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/qt")
+  endif()
+  if (APPLE AND EXISTS /opt/homebrew/opt/qt)
+    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/qt")
   endif()
   if (USE_QT6)
     if (APPLE AND EXISTS /usr/local/opt/qt@6)
@@ -1281,13 +1349,6 @@ if(NOT HEADLESS)
     endif()
     if (APPLE AND EXISTS /opt/homebrew/opt/qt@6)
       list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/qt@6")
-    endif()
-  else()
-    if (APPLE AND EXISTS /usr/local/opt/qt@5)
-      list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/qt@5")
-    endif()
-    if (APPLE AND EXISTS /opt/homebrew/opt/qt@5)
-      list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/qt@5")
     endif()
   endif()
 
@@ -1432,22 +1493,19 @@ endif()
 # Stack size 8MB; github issue 116
 target_compile_definitions(OpenSCADLibInternal PUBLIC "STACKSIZE=${STACKSIZE}") # used as default in src/platform/PlatformUtils.h
 
+set(OFFSCREEN_METHODS "")
 if(NULLGL)
-  set(OFFSCREEN_METHOD "NULLGL")
-  message(STATUS "Offscreen OpenGL Context - using NULLGL")
-else()
-  SET(OFFSCREEN_METHOD "<undefined>")
+  list(APPEND OFFSCREEN_METHODS "nullgl")
 endif()
 if(APPLE)
   target_compile_definitions(OpenSCADLibInternal PUBLIC OPENSCAD_OS="Mac OS X")
-  message(STATUS "Offscreen OpenGL Context - using Apple CGL/NSOpenGL")
-  set(PLATFORM_SOURCES src/platform/PlatformUtils-mac.mm src/io/imageutils-macosx.cc src/platform/CocoaUtils.mm)
+  set(PLATFORM_SOURCES src/platform/PlatformUtils-mac.mm src/io/imageutils-lodepng.cc src/platform/CocoaUtils.mm)
   if(NOT HEADLESS)
     set(PLATFORM_SOURCES ${PLATFORM_SOURCES} src/gui/AppleEvents.cc)
   endif()
   if(NOT NULLGL)
     target_compile_definitions(OpenSCADLibInternal PUBLIC GL_SILENCE_DEPRECATION)
-    set(OFFSCREEN_METHOD "Apple CGL/NSOpenGL")
+    list(APPEND OFFSCREEN_METHODS "cgl")
     set(PLATFORM_SOURCES ${PLATFORM_SOURCES}
         src/glview/offscreen-old/OffscreenContextNSOpenGL.mm
         src/glview/OffscreenContextCGL.cc)
@@ -1458,10 +1516,9 @@ elseif(UNIX)
   target_compile_definitions(OpenSCADLibInternal PUBLIC OPENSCAD_OS="Unix")
   set(PLATFORM_SOURCES src/io/imageutils-lodepng.cc src/platform/PlatformUtils-posix.cc)
   if(NOT NULLGL)
-    set(OFFSCREEN_METHOD "Unix")
     if(ENABLE_EGL AND OpenGL_EGL_FOUND)
       target_compile_definitions(OpenSCADLibInternal PUBLIC ENABLE_EGL)
-      set(OFFSCREEN_METHOD "${OFFSCREEN_METHOD} EGL")
+      list(APPEND OFFSCREEN_METHODS "egl")
       set(PLATFORM_SOURCES ${PLATFORM_SOURCES}
 	src/glview/offscreen-old/OffscreenContextEGL.cc
         src/glview/OffscreenContextEGL.cc)
@@ -1472,26 +1529,48 @@ elseif(UNIX)
     endif()
     if(ENABLE_GLX AND OpenGL_GLX_FOUND)
       target_compile_definitions(OpenSCADLibInternal PUBLIC ENABLE_GLX)
-      set(OFFSCREEN_METHOD "${OFFSCREEN_METHOD} GLX")
+      list(APPEND OFFSCREEN_METHODS "glx")
       set(PLATFORM_SOURCES ${PLATFORM_SOURCES}
           src/glview/offscreen-old/OffscreenContextGLX.cc
           src/glview/OffscreenContextGLX.cc)
       find_package(X11 REQUIRED)
       target_link_libraries(OpenSCADLibInternal PUBLIC X11::X11 ${CMAKE_DL_LIBS})
     endif()
-    message(STATUS "Offscreen OpenGL Context - using ${OFFSCREEN_METHOD}")
   endif()
 elseif(WIN32)
   target_compile_definitions(OpenSCADLibInternal PUBLIC NOGDI)
   target_compile_definitions(OpenSCADLibInternal PUBLIC OPENSCAD_OS="Windows")
-  message(STATUS "Offscreen OpenGL Context - using Microsoft WGL")
   set(PLATFORM_SOURCES src/io/imageutils-lodepng.cc src/platform/PlatformUtils-win.cc)
   if(NOT NULLGL)
-    set(OFFSCREEN_METHOD "Windows WGL")
-    message(STATUS "Offscreen OpenGL Context - using Microsoft WGL")
-    set(PLATFORM_SOURCES ${PLATFORM_SOURCES} src/glview/offscreen-old/OffscreenContextWGL.cc)
+    list(APPEND OFFSCREEN_METHODS "wgl-old")
+    set(PLATFORM_SOURCES ${PLATFORM_SOURCES}
+        src/glview/offscreen-old/OffscreenContextWGL.cc
+        src/glview/OffscreenContextWGL.cc)
   endif()
 endif()
+
+if(ENABLE_OSMESA AND NOT NULLGL)
+  find_package(OSMesa)
+  if(OSMESA_FOUND)
+    target_compile_definitions(OpenSCADLibInternal PUBLIC ENABLE_OSMESA)
+    target_link_libraries(OpenSCADLibInternal PUBLIC OSMesa::OSMesa)
+    set(PLATFORM_SOURCES ${PLATFORM_SOURCES}
+        src/glview/OffscreenContextOSMesa.cc)
+    list(APPEND OFFSCREEN_METHODS "osmesa")
+  endif()
+endif()
+
+if(NOT OFFSCREEN_METHODS)
+  message(FATAL_ERROR "No offscreen OpenGL context provider found on this system.")
+endif()
+
+if(NOT DEFAULT_OFFSCREEN_CONTEXT)
+  list(GET OFFSCREEN_METHODS 0 DEFAULT_OFFSCREEN_CONTEXT)
+elseif(NOT DEFAULT_OFFSCREEN_CONTEXT IN_LIST OFFSCREEN_METHODS)
+  list(JOIN OFFSCREEN_METHODS ", " OFFSCREEN_METHODS_STR)
+  message(FATAL_ERROR "DEFAULT_OFFSCREEN_CONTEXT '${DEFAULT_OFFSCREEN_CONTEXT}' is not among available providers: ${OFFSCREEN_METHODS_STR}")
+endif()
+target_compile_definitions(OpenSCADLibInternal PUBLIC DEFAULT_OFFSCREEN_CONTEXT="${DEFAULT_OFFSCREEN_CONTEXT}")
 
 # NOTE: To keep HEADLESS builds working, do NOT add Qt-dependent sources here,
 #       see GUI_SOURCES list below for that.
@@ -1549,6 +1628,7 @@ set(CORE_SOURCES
   src/core/TransformNode.cc
   src/core/Tree.cc
   src/core/UndefType.cc
+  src/core/UnicodeIdentifier.cc
   src/core/UserModule.cc
   src/core/Value.cc
   src/core/builtin_functions.cc
@@ -1562,6 +1642,7 @@ set(CORE_SOURCES
   src/core/customizer/ParameterSet.cc
   src/core/function.cc
   src/core/module.cc
+  src/core/DragPatch.cc
   src/core/node.cc
   src/core/parsersettings.cc
   src/core/primitives.cc
@@ -1594,6 +1675,7 @@ set(CORE_SOURCES
   src/geometry/organic_resample.cc
   src/glview/Camera.cc
   src/glview/ColorMap.cc
+  src/glview/CsgInfo.cc
   src/glview/OffscreenContextFactory.cc
   src/glview/RenderSettings.cc
   src/glview/preview/CSGTreeNormalizer.cc
@@ -1601,7 +1683,6 @@ set(CORE_SOURCES
   src/io/DxfData.cc
   src/io/dxfdim.cc
   src/io/export.cc
-  src/io/export_amf.cc
   src/io/export_dxf.cc
   src/io/export_obj.cc
   src/io/export_off.cc
@@ -1617,7 +1698,6 @@ set(CORE_SOURCES
   src/io/export_param.cc
   src/io/export_wrl.cc
   src/io/fileutils.cc
-  src/io/import_amf.cc
   src/io/import_json.cc
   src/io/import_obj.cc
   src/io/import_off.cc
@@ -1806,7 +1886,7 @@ set(GUI_SOURCES
   ${GUI_SOURCES}
   src/openscad_gui.cc
   src/gui/AutoUpdater.cc
-  src/gui/CGALWorker.cc
+  src/gui/GeometryWorker.cc
   src/gui/CSGWorker.cc
   src/gui/ViewportControl.cc
   src/gui/Console.cc
@@ -1849,6 +1929,7 @@ set(GUI_SOURCES
   src/gui/QSettingsCached.cc
   src/gui/QWordSearchField.cc
   src/gui/ScadApi.cc
+  src/gui/PythonApi.cc
   src/gui/ScadLexer.cc
   src/gui/ScintillaEditor.cc
   src/gui/SettingsWriter.cc
@@ -1871,10 +1952,12 @@ set(GUI_SOURCES
   src/gui/parameter/ParameterText.cc
   src/gui/parameter/ParameterVector.cc
   src/gui/parameter/ParameterVirtualWidget.cc
+  src/gui/parameter/ParameterPyQtWidget.cc
   src/gui/parameter/ParameterWidget.cc
   src/gui/ai/AIDock.cc
   src/gui/ai/ChatWidget.cc
   src/gui/ai/ChatInputEdit.cc
+  src/gui/ai/ViewportGrabber.cc
   ${INPUT_DRIVER_SOURCES}
   )
 
@@ -1890,7 +1973,7 @@ set(GUI_HEADERS
     src/gui/Animate.h
     src/gui/AppleEvents.h
     src/gui/AutoUpdater.h
-    src/gui/CGALWorker.h
+    src/gui/GeometryWorker.h
     src/gui/Console.h
     src/gui/Dock.h
     src/gui/Editor.h
@@ -2091,6 +2174,10 @@ endif()
 
 file(GLOB_RECURSE TEST_SOURCES
   "src/utils/*_test.cc"
+  "src/core/*_test.cc"
+  "src/geometry/*_test.cc"
+  "src/io/*_test.cc"
+  "src/libsvg/*_test.cc"
 )
 file(GLOB_RECURSE GUI_TEST_SOURCES
   "src/gui/*_test.cc"
@@ -2158,13 +2245,12 @@ if(APPLE AND NOT APPLE_UNIX)
       COMMENT "Bundling Python.framework into app bundle for portability"
     )
 
-    # Fix the install name to use @rpath instead of absolute path
-    # We need to use the exact path as it appears in the binary (the framework Python file, not libpython.dylib)
+    # Fix the install name to use @rpath instead of absolute path.
+    # Homebrew Python may link as either the framework binary
+    # (.../Versions/X.Y/Python) or libpythonX.Y.dylib; rewrite both.
     add_custom_command(TARGET OpenSCADExe POST_BUILD
-      COMMAND install_name_tool -change
-        ${PYTHON_FRAMEWORK_LIB}
-        @rpath/Python.framework/Versions/${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/Python
-        ${CMAKE_CURRENT_BINARY_DIR}/${EXECUTABLE_NAME}.app/Contents/MacOS/${EXECUTABLE_NAME}
+      COMMAND /bin/sh -c "install_name_tool -change '${PYTHON_FRAMEWORK_LIB}' '@rpath/Python.framework/Versions/${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/Python' '${CMAKE_CURRENT_BINARY_DIR}/${EXECUTABLE_NAME}.app/Contents/MacOS/${EXECUTABLE_NAME}' || true"
+      COMMAND /bin/sh -c "install_name_tool -change '${Python3_LIBRARIES}' '@rpath/Python.framework/Versions/${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/Python' '${CMAKE_CURRENT_BINARY_DIR}/${EXECUTABLE_NAME}.app/Contents/MacOS/${EXECUTABLE_NAME}' || true"
       COMMENT "Updating Python library reference to use @rpath"
     )
   endif()
@@ -2198,8 +2284,9 @@ if(APPLE AND NOT APPLE_UNIX)
   if(ENABLE_GUI_TESTS)
     file(COPY
          ${CMAKE_SOURCE_DIR}/tests/data/basic-ux
+         ${CMAKE_SOURCE_DIR}/tests/data/libraries
          ${CMAKE_SOURCE_DIR}/tests/data/modulecache-tests
-         DESTINATION ${BUNDLE_RESOURCES_DIR}/tests)
+         DESTINATION ${BUNDLE_RESOURCES_DIR}/tests/data)
   endif()
 
 elseif(MINGW)
@@ -2251,6 +2338,10 @@ if (USE_QT6)
   endif()
   if(MXECROSS)
     target_link_libraries(OpenSCADLibInternal PUBLIC Qt6::QSvgPlugin)
+    # Issue #7105 / PR #7118
+    # We need to research why libmp3lame has this as a dependency, and why we're pulling in an
+    # MP3 library in the first place.
+    target_link_libraries(OpenSCADLibInternal PUBLIC mpg123 shlwapi)
   endif()
 else()
   if(NOT HEADLESS)
@@ -2458,9 +2549,9 @@ if(NOT APPLE OR APPLE_UNIX)
 	      install(DIRECTORY "${PYTHON_MINGW_DEVPATH}/${PYTHON_MINGW_REPODIR}/lib/"
 	              DESTINATION "lib")
 	    else()
-	      # For native MSYS2 Windows builds, the patched MSYS2 import
-	      # library links PythonSCAD against python.org's embeddable
-	      # runtime DLL (python3XY.dll). Ship the matching embeddable
+	      # For native MSYS2 Windows builds, an import library generated
+	      # from python.org's embeddable DLL (python3XY.dll) is what the
+	      # link uses. Ship that same embeddable
 	      # stdlib zip and extension modules, not MSYS2's
 	      # lib/python3.X tree whose extension suffixes target
 	      # libpython3.X.dll.
@@ -2615,6 +2706,60 @@ if(NOT APPLE OR APPLE_UNIX)
       install(FILES ${CMAKE_BINARY_DIR}/submodules/libfive/libfive/src/libfive.so DESTINATION ${CMAKE_INSTALL_LIBDIR})
     endif()
     install(FILES ${RESOURCE_DIR}/icons/pythonscad.desktop DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications RENAME org.pythonscad.pythonscad${SUFFIX_WITH_DASH}.desktop)
+    # Merge only application/x-openscad into the shared mimeapps.list — never
+    # overwrite the whole file (preserves IDE defaults for text/x-python, etc.).
+    # Prefer an already-discovered interpreter; otherwise find a host python3
+    # independent of ENABLE_PYTHON / find_package(Python3).
+    if(Python3_EXECUTABLE)
+      set(PYTHONSCAD_HOST_PYTHON3 "${Python3_EXECUTABLE}")
+    else()
+      find_program(PYTHONSCAD_HOST_PYTHON3 NAMES python3 python REQUIRED)
+    endif()
+    install(PROGRAMS ${CMAKE_SOURCE_DIR}/scripts/merge-mimeapps-default.py
+            DESTINATION ${OPENSCAD_INSTALL_RESOURCEDIR})
+    install(CODE "
+      # Resolve dataroot/resource dirs against install-time prefix only when relative
+      # (absolute CMAKE_INSTALL_DATAROOTDIR must not get CMAKE_INSTALL_PREFIX prepended).
+      set(_dataroot \"${CMAKE_INSTALL_DATAROOTDIR}\")
+      if(NOT IS_ABSOLUTE \"\${_dataroot}\")
+        set(_dataroot \"\${CMAKE_INSTALL_PREFIX}/\${_dataroot}\")
+      endif()
+      set(_resourcedir \"${OPENSCAD_INSTALL_RESOURCEDIR}\")
+      if(NOT IS_ABSOLUTE \"\${_resourcedir}\")
+        set(_resourcedir \"\${CMAKE_INSTALL_PREFIX}/\${_resourcedir}\")
+      endif()
+      set(_mimeapps \"\$ENV{DESTDIR}\${_dataroot}/applications/mimeapps.list\")
+      set(_merge_py \"\$ENV{DESTDIR}\${_resourcedir}/merge-mimeapps-default.py\")
+      # Prefer the just-installed copy; fall back to the source tree during DESTDIR installs.
+      if(NOT EXISTS \"\${_merge_py}\")
+        set(_merge_py \"${CMAKE_SOURCE_DIR}/scripts/merge-mimeapps-default.py\")
+      endif()
+      # Direct prefix installs merge immediately. DESTDIR staging (CPack DEB/RPM,
+      # distro package builds) skips writing the shared mimeapps.list so packages
+      # do not ship/own it — those paths merge in %post / postinst instead.
+      # AppImage sets PYTHONSCAD_MERGE_MIMEAPPS=1 to keep the AppDir default.
+      set(_do_merge TRUE)
+      if(NOT \"\$ENV{DESTDIR}\" STREQUAL \"\")
+        if(NOT \"\$ENV{PYTHONSCAD_MERGE_MIMEAPPS}\" STREQUAL \"1\")
+          set(_do_merge FALSE)
+        endif()
+      endif()
+      if(_do_merge)
+        execute_process(
+          COMMAND \"${PYTHONSCAD_HOST_PYTHON3}\" \"\${_merge_py}\" merge
+                  \"\${_mimeapps}\"
+                  \"org.pythonscad.pythonscad${SUFFIX_WITH_DASH}.desktop\"
+                  \"application/x-openscad\"
+          RESULT_VARIABLE _mimeapps_rv
+          ERROR_VARIABLE _mimeapps_err
+        )
+        if(NOT _mimeapps_rv EQUAL 0)
+          message(FATAL_ERROR \"Failed to merge mimeapps.list default: \${_mimeapps_err}\")
+        endif()
+      else()
+        message(STATUS \"Skipping mimeapps.list merge under DESTDIR (set PYTHONSCAD_MERGE_MIMEAPPS=1 to force)\")
+      endif()
+    ")
     install(FILES ${RESOURCE_DIR}/icons/pythonscad.xml DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/mime/packages RENAME ${EXECUTABLE_NAME}.xml)
     install(FILES ${RESOURCE_DIR}/icons/pythonscad-48.png DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/48x48/apps RENAME pythonscad.png)
     install(FILES ${RESOURCE_DIR}/icons/pythonscad-64.png DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/64x64/apps RENAME pythonscad.png)
@@ -2727,6 +2872,8 @@ elseif(UNIX AND NOT APPLE)
   set(CPACK_RPM_PACKAGE_GROUP  "PythonSCAD designers")
   set(CPACK_RPM_PACKAGE_VENDOR "PythonSCAD designers")
   set(CPACK_RPM_PACKAGE_DESCRIPTION "PythonSCAD RPM Package")
+  # Runtime python3 for mimeapps merge hooks (script ships in the package).
+  set(CPACK_RPM_PACKAGE_REQUIRES "python3")
 
   set(CPACK_DEBIAN_PACKAGE_NAME "pythonscad")
   set(CPACK_DEBIAN_FILE_NAME "pythonscad-${OPENSCAD_YEAR}${OPENSCAD_MONTH}${OPENSCAD_DAY}.x86_64.deb")
@@ -2738,7 +2885,41 @@ elseif(UNIX AND NOT APPLE)
   set(CPACK_DEBIAN_ARCHIVE_TYPE  "gnutar")
   set(CPACK_DEBIAN_COMPRESSION_TYPE "gzip")
   set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
-  set(CPACK_DEBIAN_PACKAGE_DEPENDS "")
+  set(CPACK_DEBIAN_PACKAGE_DEPENDS "python3")
+  set(CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION ON)
+
+  # CPack does not use debian/pythonscad.postinst or pythonscad.spec; wire the
+  # same merge/remove helpers so DEB/RPM packages still register .scad defaults
+  # without shipping the shared applications/mimeapps.list.
+  # CPack packages under /usr by default, independently of the configure-time
+  # CMAKE_INSTALL_PREFIX (normally /usr/local). Generate maintainer-script
+  # paths for the actual package prefix and honor an explicit override.
+  if(NOT DEFINED CPACK_PACKAGING_INSTALL_PREFIX)
+    set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+  endif()
+  if(IS_ABSOLUTE "${CMAKE_INSTALL_DATAROOTDIR}")
+    set(_cpack_dataroot "${CMAKE_INSTALL_DATAROOTDIR}")
+  else()
+    set(_cpack_dataroot "${CPACK_PACKAGING_INSTALL_PREFIX}/${CMAKE_INSTALL_DATAROOTDIR}")
+  endif()
+  if(IS_ABSOLUTE "${OPENSCAD_INSTALL_RESOURCEDIR}")
+    set(_cpack_resourcedir "${OPENSCAD_INSTALL_RESOURCEDIR}")
+  else()
+    set(_cpack_resourcedir "${CPACK_PACKAGING_INSTALL_PREFIX}/${OPENSCAD_INSTALL_RESOURCEDIR}")
+  endif()
+  set(CPACK_MIMEAPPS_LIST "${_cpack_dataroot}/applications/mimeapps.list")
+  set(CPACK_MIMEAPPS_MERGE_SCRIPT "${_cpack_resourcedir}/merge-mimeapps-default.py")
+  set(CPACK_MIMEAPPS_DESKTOP_ID "org.pythonscad.pythonscad${SUFFIX_WITH_DASH}.desktop")
+  # Basenames must be postinst/prerm for CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA.
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/cpack-debian")
+  configure_file("${CMAKE_SOURCE_DIR}/cmake/cpack/mimeapps-postinst.sh.in"
+                 "${CMAKE_BINARY_DIR}/cpack-debian/postinst" @ONLY)
+  configure_file("${CMAKE_SOURCE_DIR}/cmake/cpack/mimeapps-prerm.sh.in"
+                 "${CMAKE_BINARY_DIR}/cpack-debian/prerm" @ONLY)
+  set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+      "${CMAKE_BINARY_DIR}/cpack-debian/postinst;${CMAKE_BINARY_DIR}/cpack-debian/prerm")
+  set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "${CMAKE_BINARY_DIR}/cpack-debian/postinst")
+  set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE "${CMAKE_BINARY_DIR}/cpack-debian/prerm")
 
 endif()
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/COPYING")

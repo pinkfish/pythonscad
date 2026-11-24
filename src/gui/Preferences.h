@@ -134,7 +134,6 @@ public slots:
   void on_lineEditOctoPrintURL_editingFinished();
   void on_lineEditOctoPrintApiKey_editingFinished();
   void on_pushButtonOctoPrintApiKey_clicked();
-  void on_textEditPythonImportList_textChanged();
   void on_pushButtonOctoPrintRequestApiKey_clicked();
   void on_lineEditLocalAppExecutable_editingFinished();
   void on_toolButtonLocalAppSelectExecutable_clicked();
@@ -166,6 +165,11 @@ public slots:
   void on_checkBoxSessionManagementEnabled_toggled(bool);
   void on_checkBoxAutosaveSessionEnabled_toggled(bool);
   void on_spinBoxAutosaveSessionInterval_valueChanged(int);
+
+  // Network
+  void on_lineEditCaCertPath_editingFinished();
+  void on_toolButtonCaCertBrowse_clicked();
+  void on_checkBoxTlsSkipVerify_toggled(bool);
 
   // AI Config Slots
   void on_comboBoxAIProfile_currentIndexChanged(int);

@@ -15,7 +15,9 @@ Get the bounding box dimensions of an object.
     size(obj)
     ```
 
-**Returns:** A list `[width, height, depth]` for 3D objects or `[width, height]` for 2D objects.
+**Returns:** A vector `[width, height, depth]` for 3D objects or
+`[width, height]` for 2D objects. Both 2D and 3D results support vector
+arithmetic (e.g. `obj.size * 2`).
 
 **Examples:**
 
@@ -26,6 +28,10 @@ Get the bounding box dimensions of an object.
 
     c = cube([10, 20, 30])
     print(c.size)  # [10.0, 20.0, 30.0]
+
+    s = square([10, 20])
+    print(s.size)       # [10.0, 20.0]
+    print(s.size * 2)   # [20.0, 40.0]
     ```
 
 ---
@@ -43,7 +49,10 @@ Get the minimum corner coordinates of the bounding box.
     position(obj)
     ```
 
-**Returns:** A list `[x, y, z]` for 3D objects or `[x, y]` for 2D objects, representing the minimum corner of the bounding box.
+**Returns:** A vector `[x, y, z]` for 3D objects or `[x, y]` for 2D objects,
+representing the minimum corner of the bounding box. Both support vector
+arithmetic, so e.g. `obj.translate(obj.position * -1)` recenters 2D or 3D
+objects alike.
 
 **Examples:**
 
@@ -54,6 +63,10 @@ Get the minimum corner coordinates of the bounding box.
 
     c = cube(10).translate([5, 5, 5])
     print(c.position)  # [5.0, 5.0, 5.0]
+
+    s = square(10).translate([3, 4])
+    print(s.position)                  # [3.0, 4.0]
+    s.translate(s.position * -1).show()  # back to the origin
     ```
 
 ---
@@ -200,7 +213,7 @@ Get a list of edge solids from a face or 2D object.
 
 ## inside
 
-Check whether a given point is inside the solid.
+Check whether a given point is inside an object (2D or 3D).
 
 **Syntax:**
 
@@ -215,10 +228,13 @@ Check whether a given point is inside the solid.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `obj` | solid | The solid to test against |
-| `point` | `[x, y, z]` | The point to test |
+| `obj` | solid | The 2D or 3D object to test against |
+| `point` | `[x, y]` or `[x, y, z]` | Point to test. Use 2 components for 2D objects; use 3 for 3D. Missing components default to `0`. Extra components beyond the object dimension are ignored for 2D. |
 
-**Returns:** `True` if the point is inside the solid, `False` otherwise.
+**Returns:** `True` if the point is classified as inside, `False` otherwise.
+
+- **2D:** Points in the interior **or on the boundary** (edge or vertex) return `True`.
+- **3D:** Uses a ray-crossing test; points exactly on the surface are not guaranteed to return `True`.
 
 **Examples:**
 
@@ -230,6 +246,12 @@ Check whether a given point is inside the solid.
     c = cube(10)
     print(c.inside([5, 5, 5]))   # True
     print(c.inside([15, 5, 5]))  # False
+
+    s = square(10, center=True)
+    print(s.inside([0, 0]))      # True (interior)
+    print(s.inside([5, 0]))      # True (on edge)
+    print(s.inside([5, 5]))      # True (on vertex)
+    print(s.inside([10, 10]))    # False
     ```
 
 ---

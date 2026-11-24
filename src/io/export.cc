@@ -28,17 +28,21 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <locale>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -48,6 +52,7 @@
 #include <io.h>
 #endif
 
+#include "core/node.h"
 #include "geometry/Geometry.h"
 #include "geometry/GeometryUtils.h"
 #include "geometry/PolySet.h"
@@ -56,6 +61,7 @@
 #include "glview/ColorMap.h"
 #include "glview/RenderSettings.h"
 #include "utils/printutils.h"
+#include "utils/scope_guard.hpp"
 
 #define QUOTE(x__) #x__
 #define QUOTED(x__) QUOTE(x__)
@@ -83,7 +89,6 @@ Containers& containers()
     add_item(*containers, {FileFormat::OBJ, "obj", "obj", "OBJ"});
     add_item(*containers, {FileFormat::OFF, "off", "off", "OFF"});
     add_item(*containers, {FileFormat::WRL, "wrl", "wrl", "VRML"});
-    add_item(*containers, {FileFormat::AMF, "amf", "amf", "AMF"});
     add_item(*containers, {FileFormat::_3MF, "3mf", "3mf", "3MF"});
     add_item(*containers, {FileFormat::DXF, "dxf", "dxf", "DXF"});
     add_item(*containers, {FileFormat::SVG, "svg", "svg", "SVG"});
@@ -94,7 +99,7 @@ Containers& containers()
     add_item(*containers, {FileFormat::PARAM, "param", "param", "param"});
     add_item(*containers, {FileFormat::AST, "ast", "ast", "AST"});
     add_item(*containers, {FileFormat::STEP, "step", "stp", "STEP"});
-    add_item(*containers, {FileFormat::GCODE, "gcode", "gcode", "GCDODE"});
+    add_item(*containers, {FileFormat::GCODE, "gcode", "gcode", "GCODE"});
     add_item(*containers, {FileFormat::TERM, "term", "term", "term"});
     add_item(*containers, {FileFormat::ECHO, "echo", "echo", "echo"});
     add_item(*containers, {FileFormat::PNG, "png", "png", "PNG"});
@@ -171,9 +176,8 @@ bool is3D(FileFormat format)
 {
   return format == FileFormat::ASCII_STL || format == FileFormat::BINARY_STL ||
          format == FileFormat::OBJ || format == FileFormat::OFF || format == FileFormat::WRL ||
-         format == FileFormat::AMF || format == FileFormat::_3MF || format == FileFormat::NEFDBG ||
-         format == FileFormat::PS || format == FileFormat::NEF3 || format == FileFormat::STEP ||
-         format == FileFormat::POV;
+         format == FileFormat::_3MF || format == FileFormat::NEFDBG || format == FileFormat::PS ||
+         format == FileFormat::NEF3 || format == FileFormat::STEP || format == FileFormat::POV;
 }
 
 bool is2D(FileFormat format)
@@ -212,28 +216,65 @@ ExportInfo createExportInfo(const FileFormat& format, const FileFormatInfo& info
   return exportInfo;
 }
 
+/*!
+   Build one 3MF object per top-level part, named after the Python variable
+   that produced it when that is known.
+
+   export_3mf() has always accepted a vector of parts and calls SetName() on
+   each mesh, but the GUI path only ever handed it a single part called
+   "PythonSCAD Model". A design whose top-level objects were kept separate
+   therefore arrived in the slicer as one anonymous object, discarding both
+   the split and the names.
+ */
+static std::vector<Export3mfPartInfo> collect3mfParts(const std::shared_ptr<const Geometry>& geom)
+{
+  std::vector<Export3mfPartInfo> infos;
+
+  const auto geomlist = std::dynamic_pointer_cast<const GeometryList>(geom);
+  if (!geomlist) {
+    infos.emplace_back(geom, "PythonSCAD Model", nullptr);
+    return infos;
+  }
+
+  int index = 0;
+  // flatten() rather than getChildren(), so a list nested inside a list still
+  // yields one part per leaf instead of one part holding a sub-list.
+  for (const auto& child : geomlist->flatten()) {
+    ++index;
+    std::string name;
+#ifdef ENABLE_PYTHON
+    if (child.first) name = child.first->py_name;
+#endif
+    // Unnamed parts still need a stable, distinguishable label; a slicer
+    // listing several identical blanks is no better than one object.
+    if (name.empty()) name = "Object " + std::to_string(index);
+    infos.emplace_back(child.second, name, nullptr);
+  }
+
+  if (infos.empty()) infos.emplace_back(geom, "PythonSCAD Model", nullptr);
+  return infos;
+}
+
 static void exportFile(const std::shared_ptr<const Geometry>& root_geom, std::ostream& output,
                        const ExportInfo& exportInfo)
 {
+  // Exported files always use '.' as the decimal point, whatever the global C++ locale is.
+  const std::locale previous_locale = output.imbue(std::locale::classic());
+  auto restore_locale = sg::make_scope_guard([&]() { output.imbue(previous_locale); });
+
   switch (exportInfo.format) {
   case FileFormat::ASCII_STL:  export_stl(root_geom, output, false); break;
   case FileFormat::BINARY_STL: export_stl(root_geom, output, true); break;
   case FileFormat::OBJ:        export_obj(root_geom, output); break;
-  case FileFormat::OFF:        export_off(root_geom, output); break;
-  case FileFormat::WRL:        export_wrl(root_geom, output); break;
-  case FileFormat::AMF:        export_amf(root_geom, output); break;
-  case FileFormat::_3MF:       {
-    Export3mfPartInfo info(root_geom, "PythonSCAD Model", nullptr);
-    std::vector<Export3mfPartInfo> infos;
-    infos.push_back(info);
-    export_3mf(infos, output, exportInfo);
-  } break;
-  case FileFormat::DXF:   export_dxf(root_geom, output); break;
-  case FileFormat::SVG:   export_svg(root_geom, output, exportInfo); break;
-  case FileFormat::PDF:   export_pdf(root_geom, output, exportInfo); break;
-  case FileFormat::POV:   export_pov(root_geom, output, exportInfo); break;
-  case FileFormat::STEP:  export_step(root_geom, output, exportInfo); break;
-  case FileFormat::GCODE: export_gcode(root_geom, output, exportInfo); break;
+  case FileFormat::OFF:        export_off(root_geom, output, exportInfo); break;
+  case FileFormat::WRL:        export_wrl(root_geom, output, exportInfo); break;
+  case FileFormat::_3MF:       export_3mf(collect3mfParts(root_geom), output, exportInfo); break;
+  case FileFormat::DXF:        export_dxf(root_geom, output); break;
+  case FileFormat::SVG:        export_svg(root_geom, output, exportInfo); break;
+  case FileFormat::PDF:        export_pdf(root_geom, output, exportInfo); break;
+  case FileFormat::POV:        export_pov(root_geom, output, exportInfo); break;
+  case FileFormat::STEP:       export_step(root_geom, output, exportInfo); break;
+  case FileFormat::GCODE:      export_gcode(root_geom, output, exportInfo); break;
 #ifdef ENABLE_CGAL
   case FileFormat::NEFDBG: export_nefdbg(root_geom, output); break;
   case FileFormat::NEF3:   export_nef3(root_geom, output); break;
@@ -248,7 +289,30 @@ bool exportFileStdOut(const std::shared_ptr<const Geometry>& root_geom, const Ex
 #ifdef _WIN32
   _setmode(_fileno(stdout), _O_BINARY);
 #endif
-  exportFile(root_geom, std::cout, exportInfo);
+  if (exportInfo.format == FileFormat::_3MF) {
+    // lib3mf needs to seek in its output, which isn't possible when stdout is a pipe
+    // (#6895), so build the file in memory first.
+    std::stringstream buffer;
+    exportFile(root_geom, buffer, exportInfo);
+    buffer.seekp(0, std::ios::end);
+    if (buffer.tellp() <= 0) {
+      // The exporter has already logged the reason
+      LOG(message_group::Error, _("Export failed, nothing was written to standard output."));
+      return false;
+    }
+    errno = 0;
+    std::cout << buffer.rdbuf();
+  } else {
+    errno = 0;
+    exportFile(root_geom, std::cout, exportInfo);
+  }
+  std::cout.flush();
+  if (!std::cout) {
+    const int error = errno;
+    LOG(message_group::Error, _("Error writing to standard output: %1$s"),
+        error != 0 ? std::strerror(error) : "unknown error");
+    return false;
+  }
   return true;
 }
 

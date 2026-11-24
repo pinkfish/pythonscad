@@ -19,20 +19,27 @@ so it is available under either of these imports:
 ## MultiToolExporter
 
 `MultiToolExporter` is a `list` subclass whose items are
-`(name, object)` 2-tuples. The `name` is a label used to build the output
-filename and must be a non-empty string; output paths must be unique.
+`(name, object)` 2-tuples or optional `(name, object, export)` 3-tuples.
+The `name` is a label used to build the output filename and must be a
+non-empty string. The optional `export` flag defaults to `True`; set it to
+`False` for *cutters* that participate in cumulative subtraction but are
+omitted from `parts()`, `show()`, and all export paths. Output paths must be
+unique among exportable items; hidden duplicate names are allowed.
 Item order matches `dict.items()` and the multi-object form of
 [`export`](display.md#export), so a `MultiToolExporter` and a `dict` of
-parts are interchangeable (`MultiToolExporter(..., items=parts.items())`
+parts are interchangeable (`MultiToolExporter(items=parts.items())`
 and `dict(exporter.parts())`).
 
-**Filename layout:** for each item, the exporter writes to:
+**Filename layout:** for each item, per-file `export()` writes to:
 
 ```text
 {prefix}{name}{suffix}
 ```
 
-so a typical use is `prefix="out/model-"` and `suffix=".stl"`.
+so a typical use is `export(prefix="out/model-", suffix=".stl")`. Prefer
+passing `prefix` / `suffix` / `mkdir` to `export()`; constructor `prefix` /
+`suffix` / `mkdir` remain supported but emit `DeprecationWarning` when
+explicitly passed (including `""` / `False`).
 
 **Cumulative-difference semantics:** for each index `i`, the geometry
 exported is
@@ -41,29 +48,31 @@ exported is
 self[i].object − self[i+1].object − self[i+2].object − ... − self[-1].object
 ```
 
-i.e. each entry's volume minus every later entry's volume.
-This guarantees that overlapping regions are claimed by exactly one part:
+i.e. each entry's volume minus every later entry's volume, **including
+later entries with `export=False`**. Cutters therefore affect only earlier
+list entries; ordering semantics are unchanged. This guarantees that
+overlapping regions are claimed by exactly one exported part:
 **later entries "win" over earlier ones**, so each part only keeps the
-volume not claimed by any subsequent part. The last entry is exported
-as-is (no degenerate one-child `difference` node) and therefore claims
-everything that overlaps with it.
+volume not claimed by any subsequent item. The last list entry is exported
+as-is (no degenerate one-child `difference` node) when it is exportable and
+therefore claims everything that overlaps with it.
 
 **Constructor:**
 
 === "Python"
 
     ```python
-    MultiToolExporter(prefix, suffix, mkdir=False, items=())
+    MultiToolExporter(prefix=None, suffix=None, mkdir=None, items=())
     ```
 
 **Parameters:**
 
 | Parameter | Type                            | Default | Description                                                                            |
 |-----------|---------------------------------|---------|----------------------------------------------------------------------------------------|
-| `prefix`  | `str`                           | —       | Prepended to every output filename                                                     |
-| `suffix`  | `str`                           | —       | Appended to every output filename (typically the extension, e.g. `".stl"`, `".3mf"`)   |
-| `mkdir`   | `bool`                          | `False` | If `True`, create each output file's directory with `os.makedirs(..., exist_ok=True)`. See note below. |
-| `items`   | iterable of `(name, object)`    | `()`    | Optional initial items (e.g. `a_dict.items()`), validated as if they were appended one at a time. |
+| `prefix`  | `str` or `None`                 | `None`  | Default prepended to every per-file output filename. Prefer `export(prefix=...)`. Passing a value (including `""`) is deprecated. |
+| `suffix`  | `str` or `None`                 | `None`  | Default appended to every per-file output filename (typically the extension). Prefer `export(suffix=...)`. Passing a value (including `""`) is deprecated. |
+| `mkdir`   | `bool` or `None`                | `None`  | Default whether to create each output file's directory with `os.makedirs(..., exist_ok=True)`. Prefer `export(mkdir=...)`. Passing a value (including `False`) is deprecated. See note below. |
+| `items`   | iterable of `(name, object)` or `(name, object, export)` | `()` | Optional initial items, validated as if appended. `export` must be `bool` (`0`/`1` rejected). |
 
 When `mkdir=True`, filenames without a directory component (e.g.
 `"flag-"` rather than `"out/flag-"`) are exported as-is - no directory
@@ -73,21 +82,23 @@ is created and no error is raised.
 
 | Method            | Description                                                                                                              |
 |-------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `append(item)`    | Append a single `(name, object)` 2-tuple. Validates the shape.                                                           |
-| `extend(items)`   | Append each `(name, object)` from an iterable.                                                                           |
-| `insert(i, item)` | Insert a single `(name, object)` 2-tuple at position `i`.                                                                |
-| `parts()`         | Return computed `(name, geometry)` pairs in declaration order. Useful for lower-level `dict(exporter.parts())` 3MF export. |
-| `export()`        | Write each part to its own file. Raises `ValueError` if any two items would write to the same output path.              |
-| `export(single_file="out/model.3mf")` | Write all computed parts into one multi-object 3MF file. Raises `ValueError` for non-`.3mf` paths or duplicate part names. |
-| `show()`          | Render each part into the preview viewport (same cumulative-difference semantics as `export`).                           |
+| `append(item)`    | Append a single `(name, object)` or `(name, object, export)` tuple. Validates the shape.                                                           |
+| `extend(items)`   | Append each item tuple from an iterable.                                                                           |
+| `insert(i, item)` | Insert a single item tuple at position `i`.                                                                |
+| `parts()`         | Return computed `(name, geometry)` pairs for exportable items only. Useful for lower-level `dict(exporter.parts())` 3MF export. |
+| `export(prefix=..., suffix=..., mkdir=...)` | Write each exportable part to its own file. Path layout args override instance defaults for this call. Raises `ValueError` if any two exportable items would write to the same output path. |
+| `export(single_file="out/model.3mf")` | Write exportable parts into one 3MF file. No-ops when all hidden. Raises `ValueError` for non-`.3mf` paths or duplicate exportable names. |
+| `show(render=False)` | Render each exportable part into the preview viewport (same cumulative-difference semantics as `export`). With `render=True`, each part is evaluated to a mesh first — see [Preview artifacts](#preview-artifacts). |
 
 **Validation:**
 
-* Every inserted item must be a 2-tuple of `(str, object)`. Anything else
-  raises `TypeError`.
+* Every inserted item must be a 2-tuple of `(str, object)` or a 3-tuple of
+  `(str, object, bool)`. Anything else raises `TypeError`.
 * The `name` must be a non-empty string. Empty names raise `ValueError`.
-* At `export()` time, the full output filename
-  (`f"{prefix}{name}{suffix}"`) of every item is normalised with
+* The optional third element must be an actual `bool` (`0`/`1` and other
+  truthy values are rejected).
+* At per-file `export()` time, the full output filename
+  (`f"{prefix}{name}{suffix}"`) of every **exportable** item is normalised with
   `os.path.normcase(os.path.normpath(filename))` (plus an extra
   `.casefold()` on macOS) and any collision raises `ValueError` rather
   than letting later parts silently overwrite earlier ones. This rejects
@@ -95,9 +106,29 @@ is created and no error is raised.
   `"b"`, plus case-only collisions like `"a.stl"` vs `"A.stl"` on
   Windows and macOS (whose default filesystems are case-insensitive).
   Linux treats such case-only pairs as distinct files and is left
-  alone.
+  alone. Hidden (`export=False`) duplicate names are allowed.
 
 **Examples:**
+
+A two-color flag with a hidden slot cutter after both printable parts (the
+slot subtracts from both colors but is not exported):
+
+=== "Python"
+
+    ```python
+    from pythonscad import *
+
+    background = cube([200, 100, 1]).color("blue")
+    slot       = cube([40, 40, 2]).translate([80, 30, -0.5])
+    star       = cylinder(r=20, h=2, fn=5).translate([100, 50, -0.5]).color("red")
+
+    exporter = MultiToolExporter()
+    exporter.append(("blue", background))         # blue minus slot and star
+    exporter.append(("red", star))                # red minus slot
+    exporter.append(("slot", slot, False))        # cuts both; no file
+    exporter.export(prefix="out/flag-", suffix=".stl", mkdir=True)
+    # -> writes out/flag-blue.stl and out/flag-red.stl only
+    ```
 
 A two-color flag (red star cut out of a blue background):
 
@@ -109,10 +140,10 @@ A two-color flag (red star cut out of a blue background):
     background = cube([200, 100, 1]).color("blue")
     star       = cylinder(r=20, h=2, fn=5).translate([100, 50, -0.5]).color("red")
 
-    exporter = MultiToolExporter("out/flag-", ".stl", mkdir=True)
+    exporter = MultiToolExporter()
     exporter.append(("blue", background))    # blue: rectangle minus the star area
     exporter.append(("red",  star))          # red: the star itself (later wins)
-    exporter.export()
+    exporter.export(prefix="out/flag-", suffix=".stl", mkdir=True)
     # -> writes out/flag-blue.stl and out/flag-red.stl
     ```
 
@@ -127,11 +158,8 @@ Seeding from the constructor:
     blue = cube(10).color("blue").right(5)
 
     MultiToolExporter(
-        prefix="out/cube-",
-        suffix=".3mf",
-        mkdir=True,
         items=[("red", red), ("blue", blue)],
-    ).export()
+    ).export(prefix="out/cube-", suffix=".3mf", mkdir=True)
     ```
 
 Previewing the same split inside the GUI without writing files:
@@ -141,17 +169,40 @@ Previewing the same split inside the GUI without writing files:
     ```python
     from pythonscad import *
 
-    exporter = MultiToolExporter("ignored-", ".stl")
+    exporter = MultiToolExporter()
     exporter.append(("red",  red))
     exporter.append(("blue", blue))
     exporter.show()
     ```
 
+### Preview artifacts {#preview-artifacts}
+
+Every part except the last is a `difference` of its object minus all later
+objects. When the parts have the same height (for example several colors
+extruded to the same `H`), the cutters share the part's top and bottom
+planes. F5 (OpenCSG) previews such a `difference` with the classic
+coplanar-face artifacts: holes look see-through (lettering cut into a rim
+loses its top) and the caps flicker. Offsetting parts does not help, because
+the coplanar faces are inside each part's own `difference`.
+
+Pass `render=True` to evaluate each part to a mesh before showing it:
+
+=== "Python"
+
+    ```python
+    exporter.show(render=True)
+    ```
+
+The preview then shows exactly the flush solids that `export()` writes, at
+the cost of one geometry evaluation per part. `parts()` and `export()` are
+unaffected.
+
 ### Single-file 3MF export
 
 Pass `single_file` to write one 3MF file containing every computed part as a
 named object. This is useful for slicers such as PrusaSlicer, where each 3MF
-object can be assigned to a different tool or filament color:
+object can be assigned to a different tool or filament color. Prefix and
+suffix are unused on this path:
 
 === "Python"
 
@@ -161,7 +212,7 @@ object can be assigned to a different tool or filament color:
     background = cube([200, 100, 1]).color("blue")
     star       = cylinder(r=20, h=2, fn=5).translate([100, 50, -0.5]).color("red")
 
-    exporter = MultiToolExporter("", "")  # prefix/suffix unused for this path
+    exporter = MultiToolExporter()
     exporter.append(("blue", background))
     exporter.append(("red",  star))
 
@@ -169,9 +220,11 @@ object can be assigned to a different tool or filament color:
     exporter.export(single_file="flag.3mf")
     ```
 
-For single-file export, item names become 3MF object names and must be unique.
-`single_file` currently supports only `.3mf`; use plain `export()` when you
-want one output file per part.
+For single-file export, exportable item names become 3MF object names and must
+be unique among exportable items. Hidden cutters are omitted. If every item
+is hidden, single-file export is a no-op.
+`single_file` currently supports only `.3mf`; use plain `export(prefix=..., suffix=...)`
+when you want one output file per part.
 
 The lower-level `export(dict(exporter.parts()), "flag.3mf")` form is still
 available if you want to build the part dictionary yourself. See

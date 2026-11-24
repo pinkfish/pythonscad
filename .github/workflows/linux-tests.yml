@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - release/**
   pull_request:
   workflow_dispatch:
 
@@ -25,6 +26,9 @@ jobs:
           - os: ubuntu-22.04
             # libqscintilla2-qt6-dev not packaged
             qt: qt6
+          - os: ubuntu-24.04
+            # libqscintilla2-qt6-dev not packaged
+            qt: qt5
 
     runs-on: ${{ matrix.os }}
 
@@ -46,7 +50,7 @@ jobs:
       run: |
         which sudo || ( apt update && apt install -y sudo )
         sudo -E ./scripts/get-dependencies.py --yes --profile pythonscad-${{ matrix.qt }}
-    - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+    - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
     - name: Install gcovr
       run: uv sync --frozen --project .github/ci/openscad-coverage
     - name: Install Python test dependencies (IPython + pexpect for --ipython tests)

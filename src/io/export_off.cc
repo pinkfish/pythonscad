@@ -30,7 +30,6 @@
 #include <memory>
 #include <ostream>
 
-#include "Feature.h"
 #include "geometry/Geometry.h"
 #include "geometry/PolySet.h"
 #include "geometry/PolySetUtils.h"
@@ -44,12 +43,10 @@
 // first line, the docs above show that wrong in the first
 // example.
 
-void export_off(const std::shared_ptr<const Geometry>& geom, std::ostream& output)
+void export_off(const std::shared_ptr<const Geometry>& geom, std::ostream& output,
+                const ExportInfo& exportInfo)
 {
-  auto ps = PolySetUtils::getGeometryAsPolySet(geom);
-  if (Feature::ExperimentalPredictibleOutput.is_enabled()) {
-    ps = createSortedPolySet(*ps);
-  }
+  auto ps = createSortedPolySet(*PolySetUtils::getGeometryAsPolySet(geom));
   const auto& v = ps->vertices;
   const size_t numverts = v.size();
 
@@ -66,17 +63,17 @@ void export_off(const std::shared_ptr<const Geometry>& geom, std::ostream& outpu
     for (size_t n = 0; n < nverts; ++n) output << " " << ps->indices[i][n];
     if (has_color) {
       auto color_index = ps->color_indices[i];
-      if (color_index >= 0) {
-        auto color = ps->colors[color_index];
-        int r, g, b, a;
-        if (!color.getRgba(r, g, b, a)) {
-          LOG(message_group::Error, "Invalid color in OFF export");
-          return;
-        }
-        output << " " << r << " " << g << " " << b;
-        // Alpha channel is read by apps like MeshLab.
-        if (a != 255) output << " " << a;
+      auto color = color_index >= 0 ? ps->colors[color_index].resolved(exportInfo.defaultColor,
+                                                                       exportInfo.defaultCutoutColor())
+                                    : exportInfo.defaultColor;
+      int r, g, b, a;
+      if (!color.getRgba(r, g, b, a)) {
+        LOG(message_group::Error, "Invalid color in OFF export");
+        return;
       }
+      output << " " << r << " " << g << " " << b;
+      // Alpha channel is read by apps like MeshLab.
+      if (a != 255) output << " " << a;
     }
     output << "\n";
   }

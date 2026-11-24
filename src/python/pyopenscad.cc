@@ -24,18 +24,22 @@
  *
  */
 #include <Python.h>
+// PyFrame_GetBack() is declared here up to Python 3.10; Python.h has it from 3.11 on
+#include <frameobject.h>
 #include "genlang/genlang.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <sstream>
 #include <string>
 #include <system_error>
 #include <vector>
 #include <glview/RenderSettings.h>
+#include <atomic>
 #ifdef _WIN32
 // AttachConsole / GetStdHandle / _wfreopen for the --repl/--ipython
 // console reattach dance (see windows_reattach_console_for_repl below).
@@ -287,6 +291,7 @@ std::list<std::string> pythonInventory;
 AssignmentList customizer_parameters;
 AssignmentList customizer_parameters_finished;
 bool pythonDryRun = false;
+bool pythonPreview = false;
 PyObject *python_result_obj = nullptr;
 std::vector<SelectedObject> python_result_handle;
 bool python_runipython = false;
@@ -332,8 +337,52 @@ static PyObject *PyOpenSCADObject_new(PyTypeObject *type, PyObject *args, PyObje
  *  allocates a new PyOpenSCAD to store an existing OpenSCAD Abstract Node
  */
 
+/*!
+  Line of the user's script which is executing right now: the innermost frame
+  whose file is the file of the outermost frame (the script itself). For a node
+  created inside a function of the script this is the line in that function.
+  Returns 0 outside of python execution.
+ */
+static int python_script_line()
+{
+  PyFrameObject *frame = PyEval_GetFrame();  // borrowed
+  if (frame == nullptr) return 0;
+  Py_INCREF(frame);
+  std::vector<std::pair<std::string, int>> stack;
+  while (frame != nullptr) {
+    std::string filename;
+    PyCodeObject *code = PyFrame_GetCode(frame);
+    PyObject *fn = PyObject_GetAttrString(reinterpret_cast<PyObject *>(code), "co_filename");
+    if (fn != nullptr && PyUnicode_Check(fn)) {
+      const char *utf8 = PyUnicode_AsUTF8(fn);
+      if (utf8 != nullptr) filename = utf8;
+    }
+    if (PyErr_Occurred()) PyErr_Clear();
+    Py_XDECREF(fn);
+    Py_DECREF(code);
+    stack.emplace_back(filename, PyFrame_GetLineNumber(frame));
+    PyFrameObject *back = PyFrame_GetBack(frame);
+    Py_DECREF(frame);
+    frame = back;
+  }
+  for (const auto& entry : stack) {
+    if (entry.first == stack.back().first) return entry.second;
+  }
+  return 0;
+}
+
+/// Give node and its fresh helper children (e.g. the translates around
+/// rotate(ref=...)) the current script line, see AbstractNode::py_line.
+static void python_stamp_line(AbstractNode *node, int line)
+{
+  if (node == nullptr || node->py_line != 0) return;
+  node->py_line = line;
+  for (const auto& child : node->children) python_stamp_line(child.get(), line);
+}
+
 PyObject *PyOpenSCADObjectFromNode(PyTypeObject *type, const std::shared_ptr<AbstractNode>& node)
 {
+  if (node != nullptr && node->py_line == 0) python_stamp_line(node.get(), python_script_line());
   PyOpenSCADObject *self;
   self = reinterpret_cast<PyOpenSCADObject *>(type->tp_new(type, nullptr, nullptr));
   if (self != nullptr) {
@@ -344,23 +393,38 @@ PyObject *PyOpenSCADObjectFromNode(PyTypeObject *type, const std::shared_ptr<Abs
   return nullptr;
 }
 
-// PyGILState_STATE gstate=PyGILState_LOCKED;
+std::atomic<bool> pythonModalDialogActive{false};
 PyThreadState *tstate = nullptr;
+static thread_local int lockDepth = 0;
 
 void python_lock(void)
 {
-  // #ifndef _WIN32
-  if (tstate != nullptr && pythonInitDict != nullptr) PyEval_RestoreThread(tstate);
-  // #endif
+  if (pythonModalDialogActive.load()) return;
+  if (pythonInitDict == nullptr) return;
+  lockDepth++;
+  if (lockDepth == 0 && tstate != nullptr) {
+    PyEval_RestoreThread(tstate);
+  }
 }
 
 void python_unlock(void)
 {
-  // #ifndef _WIN32
-  if (pythonInitDict != nullptr) tstate = PyEval_SaveThread();
-  // #endif
+  if (pythonModalDialogActive.load()) return;
+  if (pythonInitDict == nullptr) return;
+  if (lockDepth == 0) {
+    tstate = PyEval_SaveThread();
+  }
+  lockDepth--;
 }
-
+const char *python_calltip(const char *funcname)
+{
+  for (PyMethodDef *m = PyOpenSCADFunctions; m->ml_name != NULL; m++) {
+    if (strcmp(m->ml_name, funcname) == 0) {
+      return m->ml_doc;
+    }
+  }
+  return nullptr;  // nothing found
+}
 /*
  *  extracts Absrtract Node from PyOpenSCAD Object
  */
@@ -665,7 +729,18 @@ static int PyOpenSCADInit(PyOpenSCADObject *self, PyObject *args, PyObject *kwds
   (void)kwds;
   return 0;
 }
-Outline2d python_getprofile(void *v_cbfunc, int fn, double arg)
+// Python callbacks (twist=, profile functions, ...) are invoked from the
+// geometry/CSG worker threads. Since #1024 python_lock() in those threads is a
+// no-op (lockDepth is thread_local), so these callbacks must acquire the GIL
+// themselves. PyGILState_Ensure() is cheap and reentrant if the GIL is held.
+static void python_report_callback_error(const char *what)
+{
+  std::string errorstr;
+  python_catch_error(errorstr);  // fetches and clears the pending exception
+  LOG(message_group::Error, "Python %1$s callback failed: %2$s", what, errorstr);
+}
+
+static Outline2d python_getprofile_locked(void *v_cbfunc, int fn, double arg)
 {
   PyObject *cbfunc = reinterpret_cast<PyObject *>(v_cbfunc);
   Outline2d result;
@@ -674,6 +749,7 @@ Outline2d python_getprofile(void *v_cbfunc, int fn, double arg)
   PyObject *polygon = PyObject_CallObject(cbfunc, args);
   Py_XDECREF(args);
   if (polygon == nullptr) {  // TODO fix
+    PyErr_Clear();           // 1-arg call failed: retry as polar r(arg, angle)
     for (unsigned int i = 0; i < (unsigned int)fn; i++) {
       double ang = 360.0 * (i / (double)fn);
       PyObject *args1 = PyTuple_Pack(2, PyFloat_FromDouble(arg), PyFloat_FromDouble(ang));
@@ -715,14 +791,33 @@ Outline2d python_getprofile(void *v_cbfunc, int fn, double arg)
   return result;
 }
 
+Outline2d python_getprofile(void *v_cbfunc, int fn, double arg)
+{
+  if (pythonInitDict == nullptr) initPython(PlatformUtils::applicationPath(), "", nullptr);
+  PyGILState_STATE gstate = PyGILState_Ensure();
+  Outline2d result = python_getprofile_locked(v_cbfunc, fn, arg);
+  if (PyErr_Occurred()) python_report_callback_error("profile");
+  PyGILState_Release(gstate);
+  return result;
+}
+
 double python_doublefunc(void *v_cbfunc, double arg)
 {
   PyObject *cbfunc = reinterpret_cast<PyObject *>(v_cbfunc);
+  PyGILState_STATE gstate = PyGILState_Ensure();
   double result = 0;
-  PyObject *args = PyTuple_Pack(1, PyFloat_FromDouble(arg));
-  PyObject *funcresult = PyObject_CallObject(cbfunc, args);
-  Py_XDECREF(args);
-  if (funcresult) result = PyFloat_AsDouble(funcresult);
+  PyObject *funcresult = PyObject_CallFunction(cbfunc, "d", arg);
+  if (funcresult == nullptr) {
+    python_report_callback_error("twist");
+  } else {
+    result = PyFloat_AsDouble(funcresult);
+    if (result == -1.0 && PyErr_Occurred()) {
+      python_report_callback_error("twist (must return a single number)");
+      result = 0;
+    }
+    Py_DECREF(funcresult);
+  }
+  PyGILState_Release(gstate);
   return result;
 }
 
@@ -1346,7 +1441,26 @@ void initPython(const std::string& binDir, const std::string& scriptpath, const 
       // If neither exists, leave config.executable unset — CPython will probe
       // using its own heuristics, guided by pythonpath_env set above.
 #else
-      PyConfig_SetBytesString(&config, &config.executable, (binDir + "/python").c_str());
+      // A local build directory has no python binary next to the executable.
+      // Pointing config.executable at that missing path stops CPython from
+      // discovering the interpreter it was linked against, including distro
+      // site-packages such as PyQt6. A venv still wins: its bin/python exists.
+      const auto pythonPath = fs::path(binDir) / "python";
+      std::error_code ec;
+      if (fs::exists(pythonPath, ec)) {
+        const auto pythonExe = pythonPath.generic_string();
+        status = PyConfig_SetBytesString(&config, &config.executable, pythonExe.c_str());
+        if (PyStatus_Exception(status)) {
+          alreadyTried = true;
+          PyConfig_Clear(&config);
+          LOG(message_group::Error, "Failed to configure Python executable '%1$s': %2$s", pythonExe,
+              status.err_msg != nullptr ? status.err_msg : "unknown error");
+          return;
+        }
+      } else if (ec) {
+        LOG(message_group::Error, "Failed to inspect Python executable '%1$s': %2$s",
+            pythonPath.generic_string(), ec.message());
+      }
 #endif
     }
 #endif
@@ -1550,6 +1664,10 @@ void initPython(const std::string& binDir, const std::string& scriptpath, const 
     PyGILState_Release(pathGil);
   }
   std::ostringstream stream;
+  /* Always refresh pythonPreview. Call sites that pass nullptr (REPL,
+   * IPython, Emscripten, GUI startup) must not keep a stale true from a
+   * previous F5 and suppress later export() writes. */
+  pythonPreview = r != nullptr && r->preview;
   if (r != nullptr) {
     stream << "preview=" << (r->preview ? "True" : "False") << "\n";
 
@@ -1567,6 +1685,8 @@ void initPython(const std::string& binDir, const std::string& scriptpath, const 
 
     const auto vpf = r->camera.fovValue();
     stream << "vpf=" << vpf << "\n";
+  } else {
+    stream << "preview=False\n";
   }
   stream << commandline_commands << "\n";
   {
@@ -1583,6 +1703,113 @@ void initPython(const std::string& binDir, const std::string& scriptpath, const 
   full_node = std::make_shared<CubeNode>(instance);  // just placeholders
 }
 
+void snapshotPythonInventory()
+{
+  if (!Py_IsInitialized() || !pythonMainModule) return;
+
+  PyGILState_STATE st = PyGILState_Ensure();
+  PyObject *key, *value;
+  Py_ssize_t pos = 0;
+  PyObject *maindict = PyModule_GetDict(pythonMainModule.get());
+  while (PyDict_Next(maindict, &pos, &key, &value)) {
+    if (!PyUnicode_Check(key)) continue;
+    std::string key_str;
+    if (!python_pyobject_to_utf8(key, key_str, "snapshotPythonInventory() key")) {
+      PyErr_Clear();
+      continue;
+    }
+    if (std::find(pythonInventory.begin(), pythonInventory.end(), key_str) == pythonInventory.end()) {
+      pythonInventory.push_back(key_str);
+    }
+  }
+  PyGILState_Release(st);
+}
+
+bool python_get_static_calltip(const std::string& className, std::string& result)
+{
+  if (!pythonMainModule) return false;
+
+  PyGILState_STATE gstate = PyGILState_Ensure();
+  bool ok = false;
+
+  PyObject *maindict = PyModule_GetDict(pythonMainModule.get());
+  PyObject *classObj = PyDict_GetItemString(maindict, className.c_str());
+  if (classObj != nullptr) {
+    PyObject *method = PyObject_GetAttrString(classObj, "get_calltip");
+    if (method != nullptr && PyCallable_Check(method)) {
+      PyObject *funcresult = PyObject_CallObject(method, nullptr);
+      if (funcresult != nullptr) {
+        if (PyUnicode_Check(funcresult)) {
+          const char *calltip = PyUnicode_AsUTF8(funcresult);
+          if (calltip != nullptr) {
+            result = calltip;
+            ok = true;
+          } else {
+            PyErr_Clear();
+          }
+        }
+        Py_DECREF(funcresult);
+      } else {
+        PyErr_Print();
+        PyErr_Clear();
+      }
+    } else {
+      PyErr_Clear();
+    }
+    Py_XDECREF(method);
+  } else {
+    PyErr_Clear();  // A missing name is not an error; it is simply not a match.
+  }
+
+  PyGILState_Release(gstate);
+  return ok;
+}
+
+bool python_call_static_editor_method(const std::string& className, const std::string& methodName,
+                                      int position)
+{
+  if (!pythonMainModule) return false;
+
+  PyGILState_STATE gstate = PyGILState_Ensure();
+  bool called = false;
+
+  PyObject *maindict = PyModule_GetDict(pythonMainModule.get());
+  PyObject *classObj = PyDict_GetItemString(maindict, className.c_str());
+  if (classObj != nullptr) {
+    PyObject *method = PyObject_GetAttrString(classObj, methodName.c_str());
+    if (method != nullptr && PyCallable_Check(method)) {
+      PyObject *posObj = PyLong_FromLong(position);
+      if (posObj != nullptr) {
+        PyObject *args = PyTuple_Pack(1, posObj);
+        Py_DECREF(posObj);
+        if (args != nullptr) {
+          PyObject *funcresult = PyObject_CallObject(method, args);
+          Py_DECREF(args);
+
+          if (funcresult != nullptr) {
+            Py_DECREF(funcresult);
+            called = true;
+          } else {
+            PyErr_Print();
+            PyErr_Clear();
+          }
+        } else {
+          PyErr_Clear();
+        }
+      } else {
+        PyErr_Clear();
+      }
+    } else {
+      PyErr_Clear();  // A missing method is not an error; simply do nothing.
+    }
+    Py_XDECREF(method);
+  } else {
+    PyErr_Clear();  // An unknown class is not an error either.
+  }
+
+  PyGILState_Release(gstate);
+  return called;
+}
 void finishPython(void)
 {
   if (!pythonDryRun) {
@@ -1767,6 +1994,197 @@ PyObject *python__getattro__(PyObject *obj, PyObject *key)
   PyObject *result = python__getitem__(obj, key);
   if (result == Py_None || result == nullptr) result = PyObject_GenericGetAttr(obj, key);
   return result;
+}
+
+static uint64_t fnv1a_mix(uint64_t h, const char *buf, Py_ssize_t len)
+{
+  for (Py_ssize_t i = 0; i < len; i++) {
+    h ^= (unsigned char)buf[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+static uint64_t python_func_hash_rec(PyObject *func, int depth, uint64_t h);
+
+// Hashes a single Python value the same way, whichever context it was found
+// in (a referenced global, a default value, a closure cell, ...): a
+// function recurses into its own bytecode hash (repr() of a function
+// embeds its address and is unstable), a module/builtin/class hashes its
+// qualified name (repr() is likewise unstable there), and anything else
+// hashes its repr() (assumed stable / address-free for ordinary values).
+static uint64_t python_func_hash_value_rec(PyObject *val, int depth, uint64_t h)
+{
+  if (val == nullptr) return h;
+
+  if (PyFunction_Check(val)) {
+    // recurse: hash the function's own bytecode instead of an unstable repr()
+    h = python_func_hash_rec(val, depth + 1, h);
+  } else if (PyModule_Check(val) || PyCFunction_Check(val) || PyType_Check(val)) {
+    // modules/builtins/classes: only the qualified name is stable, not repr()
+    PyObject *qn = PyObject_GetAttrString(val, "__name__");
+    if (qn && PyUnicode_Check(qn)) {
+      Py_ssize_t qlen;
+      const char *qbuf = PyUnicode_AsUTF8AndSize(qn, &qlen);
+      if (qbuf) h = fnv1a_mix(h, qbuf, qlen);
+    } else {
+      PyErr_Clear();
+    }
+    Py_XDECREF(qn);
+  } else {
+    // "real" values: repr() is stable here (no address embedded)
+    PyObject *repr = PyObject_Repr(val);
+    if (repr && PyUnicode_Check(repr)) {
+      Py_ssize_t rlen;
+      const char *rbuf = PyUnicode_AsUTF8AndSize(repr, &rlen);
+      if (rbuf) h = fnv1a_mix(h, rbuf, rlen);
+    } else {
+      PyErr_Clear();
+    }
+    Py_XDECREF(repr);
+  }
+  return h;
+}
+
+static uint64_t python_func_hash_rec(PyObject *func, int depth, uint64_t h)
+{
+  if (depth > 6) return h;  // guard against mutually-recursive functions
+
+  PyObject *code = PyObject_GetAttrString(func, "__code__");
+  if (code == nullptr) {
+    PyErr_Clear();
+    return h;
+  }
+
+  PyObject *marshal = PyImport_ImportModule("marshal");
+  PyObject *dumps = PyObject_GetAttrString(marshal, "dumps");
+  PyObject *bytes = PyObject_CallFunctionObjArgs(dumps, code, nullptr);
+  if (bytes && PyBytes_Check(bytes)) {
+    char *buf;
+    Py_ssize_t len;
+    PyBytes_AsStringAndSize(bytes, &buf, &len);
+    h = fnv1a_mix(h, buf, len);
+  }
+
+  PyObject *co_names = PyObject_GetAttrString(code, "co_names");
+  PyObject *globals = PyObject_GetAttrString(func, "__globals__");
+  if (co_names && globals && PyTuple_Check(co_names)) {
+    Py_ssize_t n = PyTuple_Size(co_names);
+    for (Py_ssize_t i = 0; i < n; i++) {
+      PyObject *name = PyTuple_GetItem(co_names, i);  // borrowed
+      PyObject *val = PyDict_GetItem(globals, name);  // borrowed, may be NULL
+      if (val == nullptr) continue;
+      h = python_func_hash_value_rec(val, depth, h);
+    }
+  }
+  Py_XDECREF(co_names);
+  Py_XDECREF(globals);
+
+  // Positional/keyword defaults: func.__defaults__ is a tuple (or None) of
+  // the values bound to the trailing positional parameters that weren't
+  // supplied at call time - e.g. the captured 'amount' in
+  // "def make_disp(amount): return lambda p: amount". Two closures built
+  // from the same factory with different 'amount' values must NOT hash the
+  // same, or patch()'s geometry cache would return one's result for the
+  // other.
+  PyObject *defaults = PyObject_GetAttrString(func, "__defaults__");
+  if (defaults == nullptr) {
+    PyErr_Clear();
+  } else {
+    if (PyTuple_Check(defaults)) {
+      Py_ssize_t n = PyTuple_Size(defaults);
+      for (Py_ssize_t i = 0; i < n; i++) {
+        h = python_func_hash_value_rec(PyTuple_GetItem(defaults, i), depth, h);  // borrowed
+      }
+    }
+    Py_DECREF(defaults);
+  }
+
+  // Keyword-only defaults: func.__kwdefaults__ is a dict (or None). Sort
+  // the keys first so the hash doesn't depend on (unspecified) dict
+  // iteration order.
+  PyObject *kwdefaults = PyObject_GetAttrString(func, "__kwdefaults__");
+  if (kwdefaults == nullptr) {
+    PyErr_Clear();
+  } else {
+    if (PyDict_Check(kwdefaults)) {
+      PyObject *keys = PyDict_Keys(kwdefaults);
+      if (keys) {
+        if (PyList_Sort(keys) == 0) {
+          Py_ssize_t n = PyList_Size(keys);
+          for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *key = PyList_GetItem(keys, i);  // borrowed
+            if (PyUnicode_Check(key)) {
+              Py_ssize_t klen;
+              const char *kbuf = PyUnicode_AsUTF8AndSize(key, &klen);
+              if (kbuf) h = fnv1a_mix(h, kbuf, klen);
+            }
+            PyObject *val = PyDict_GetItem(kwdefaults, key);  // borrowed
+            h = python_func_hash_value_rec(val, depth, h);
+          }
+        } else {
+          PyErr_Clear();
+        }
+        Py_DECREF(keys);
+      } else {
+        PyErr_Clear();
+      }
+    }
+    Py_DECREF(kwdefaults);
+  }
+
+  // Closure-cell contents: func.__closure__ is a tuple of cell objects (or
+  // None) holding the values captured from an enclosing scope, aligned
+  // index-for-index with code.co_freevars. This is exactly the mechanism a
+  // factory like "def make_proj(u_scale): return lambda p: [p.x*u_scale,
+  // p.y]" uses to hand patch() a per-call proj()/displacement() - without
+  // hashing the cell contents, two such closures with different captured
+  // values are indistinguishable to the cache key.
+  PyObject *closure = PyObject_GetAttrString(func, "__closure__");
+  if (closure == nullptr) {
+    PyErr_Clear();
+  } else {
+    if (PyTuple_Check(closure)) {
+      PyObject *freevars = PyObject_GetAttrString(code, "co_freevars");
+      Py_ssize_t n = PyTuple_Size(closure);
+      for (Py_ssize_t i = 0; i < n; i++) {
+        if (freevars && PyTuple_Check(freevars) && i < PyTuple_Size(freevars)) {
+          PyObject *name = PyTuple_GetItem(freevars, i);  // borrowed
+          if (name && PyUnicode_Check(name)) {
+            Py_ssize_t nlen;
+            const char *nbuf = PyUnicode_AsUTF8AndSize(name, &nlen);
+            if (nbuf) h = fnv1a_mix(h, nbuf, nlen);
+          }
+        }
+        PyObject *cell = PyTuple_GetItem(closure, i);  // borrowed
+        if (cell != nullptr) {
+          PyObject *cellval = PyCell_Get(cell);  // new reference, or NULL if empty
+          if (cellval != nullptr) {
+            h = python_func_hash_value_rec(cellval, depth, h);
+            Py_DECREF(cellval);
+          } else {
+            PyErr_Clear();
+          }
+        }
+      }
+      Py_XDECREF(freevars);
+    }
+    Py_DECREF(closure);
+  }
+
+  Py_XDECREF(bytes);
+  Py_XDECREF(dumps);
+  Py_XDECREF(marshal);
+  Py_XDECREF(code);
+  return h;
+}
+
+std::string python_func_hash(PyObject *func)
+{
+  uint64_t h = python_func_hash_rec(func, 0, 1469598103934665603ULL /* FNV offset basis */);
+  std::ostringstream os;
+  os << std::hex << h;
+  return os.str();
 }
 
 int python__setattro__(PyObject *dict, PyObject *key, PyObject *v)
@@ -2030,8 +2448,8 @@ static PyModuleDef OpenSCADModule = {PyModuleDef_HEAD_INIT,
 
 #if PY_VERSION_HEX < 0x030A0000
 // Polyfill for `PyModule_AddObjectRef`, which CPython only added in 3.10.
-// Debian bullseye and RHEL/EL 9 ship Python 3.9, so we have to emulate it
-// there. This is a near-verbatim port of CPython's upstream implementation
+// RHEL/EL 9 ships Python 3.9, so we have to emulate it there. This is a
+// near-verbatim port of CPython's upstream implementation
 // in `Python/modsupport.c` (the body of the function below matches
 // the 3.10+ source line for line, only reformatted to project style),
 // so the validation surface (TypeError on a non-module first arg,
@@ -2240,12 +2658,96 @@ static void windows_reattach_console_for_repl(void)
 // pollute `dir()` with a couple hundred names regardless of what the
 // user actually intended to use.
 //
+// Drive the session through Python's already-initialized `sys.stdin`
+// rather than `PyRun_AnyFileFlags(stdin)`. The latter builds a second
+// buffered reader on the same C FILE*, which SIGBUS-es inside
+// `_buffered_init` on Homebrew Python 3.15 (mimalloc-backed) when the
+// session later imports ctypes/sysconfig (#1138). `--ipython` already
+// avoids that path and works; match that IO model here.
+//
 // This helper assumes Py_IsInitialized() is already true; callers must
 // gate it behind that check.
 static void run_basic_python_repl(void)
 {
-  pymain_run_interactive_hook();
-  PyRun_AnyFileFlags(stdin, "<stdin>", nullptr);
+  // Only enable readline / __interactivehook__ on a real TTY. CPython's
+  // own non-interactive SimpleFile path skips the hook; loading it for
+  // piped CI scripts has been implicated in flaky SIGBUS under Homebrew
+  // Python 3.15 + ctypes (#1138).
+  //
+  // TTY → interactive >>> loop; pipe/file → exec the whole script once
+  // (same contract as non-tty PyRun_SimpleFile).
+  // Run the bootstrap inside a function so its `sys`/`code` locals cannot
+  // be clobbered by a piped user script that assigns those names in
+  // `__main__` (PyRun_SimpleString shares that dict). Flush in `finally`
+  // after a piped exec: non-tty stdout is fully buffered and we return
+  // without Py_Finalize, so prints before an exception would otherwise
+  // be lost (CI smokes capture stdout for the OK marker).
+  int is_tty = 0;
+  {
+    PyObject *sysmod = PyImport_ImportModule("sys");
+    if (sysmod != nullptr) {
+      PyObject *stdin_obj = PyObject_GetAttrString(sysmod, "stdin");
+      if (stdin_obj != nullptr) {
+        PyObject *r = PyObject_CallMethod(stdin_obj, "isatty", nullptr);
+        if (r != nullptr) {
+          is_tty = PyObject_IsTrue(r);
+          Py_DECREF(r);
+        } else {
+          PyErr_Clear();
+        }
+        Py_DECREF(stdin_obj);
+      } else {
+        PyErr_Clear();
+      }
+      Py_DECREF(sysmod);
+    } else {
+      PyErr_Clear();
+    }
+  }
+  if (is_tty) {
+    pymain_run_interactive_hook();
+  }
+
+  static const char *boot =
+    "def _pythonscad_run_basic_repl():\n"
+    "    import code, sys\n"
+    "    _ns = sys.modules['__main__'].__dict__\n"
+    "    if sys.stdin.isatty():\n"
+    "        code.interact(local=_ns)\n"
+    "    else:\n"
+    "        _src = sys.stdin.read()\n"
+    "        try:\n"
+    "            if _src:\n"
+    "                exec(compile(_src, '<stdin>', 'exec'), _ns)\n"
+    "        finally:\n"
+    "            try:\n"
+    "                sys.stdout.flush()\n"
+    "                sys.stderr.flush()\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "_pythonscad_run_basic_repl()\n"
+    "del _pythonscad_run_basic_repl\n";
+  if (PyRun_SimpleString(boot) != 0) {
+    // Exception already printed by PyRun_SimpleString; clear so callers
+    // that fall through (e.g. ipython fallback) do not inherit it.
+    PyErr_Clear();
+  }
+}
+
+// On Apple, prefer the system malloc for CPython's memory domains when
+// the user has not already set PYTHONMALLOC. Homebrew Python 3.15 links
+// libmimalloc; under --repl/--ipython, `import ctypes` can SIGBUS/SIGSEGV
+// inside `_buffered_init` with that allocator (#1138, #1149). Must run
+// before Py_Initialize / Py_PreInitialize. No-op on free-threaded builds
+// where mimalloc is required.
+static void prefer_system_malloc_for_embedded_python(void)
+{
+#if defined(__APPLE__) && !defined(Py_GIL_DISABLED)
+  if (std::getenv("PYTHONMALLOC") == nullptr) {
+    // setenv(..., 0) does not overwrite an existing value.
+    (void)setenv("PYTHONMALLOC", "malloc", 0);
+  }
+#endif
 }
 
 // Open the basic embedded CPython REPL on stdin. Reachable explicitly
@@ -2262,6 +2764,7 @@ int repl(void)
   // CRT-orphaned ones GUI-subsystem children get on Windows.
   windows_reattach_console_for_repl();
 #endif
+  prefer_system_malloc_for_embedded_python();
   initPython(PlatformUtils::applicationPath(), "", nullptr);
   if (!Py_IsInitialized()) {
     fprintf(stderr,
@@ -2341,6 +2844,7 @@ int ipython(const std::vector<std::string>& args)
   // fallback below inherits a working console when IPython is missing.
   windows_reattach_console_for_repl();
 #endif
+  prefer_system_malloc_for_embedded_python();
   initPython(PlatformUtils::applicationPath(), "", nullptr);
   if (!Py_IsInitialized()) {
     fprintf(stderr,

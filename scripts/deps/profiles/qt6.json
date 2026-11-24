@@ -71,9 +71,12 @@
     },
     "macos": {
       "extends": null,
-      "packages": [
-        "qt",
-        "qscintilla2"
+      "pre_commands": [
+        "brew tap openscad/homebrew-tap"
+      ],
+      "packages": [],
+      "post_commands": [
+        "bash scripts/ci/prepare-macos-pyqt6-qt.sh"
       ]
     },
     "mageia": {
@@ -112,10 +115,21 @@
     "msys2": {
       "extends": null,
       "packages": [
+        "qt6-base:p",
+        "qt6-5compat:p",
+        "qt6-multimedia:p",
+        "qt6-svg:p",
+        "qscintilla-qt6:p"
+      ]
+    },
+    "msys2": {
+      "extends": null,
+      "packages": [
         "qscintilla-qt6:p",
         "qt6-5compat:p",
         "qt6-multimedia:p",
-        "qt6-svg:p"
+        "qt6-svg:p",
+        "tools:p"
       ]
     }
   }

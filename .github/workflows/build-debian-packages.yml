@@ -25,7 +25,7 @@ permissions:
 jobs:
   prepare-matrix:
     name: Prepare build matrix from supported distributions
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -145,8 +145,8 @@ jobs:
           sudo apt-get update
 
           # Determine Qt profile based on distribution version
-          # Older distros (Ubuntu 22.04, Debian 11) use Qt5, newer use Qt6
-          if [ "$MATRIX_DISTRO" = "jammy" ] || [ "$MATRIX_DISTRO" = "bullseye" ]; then
+          # Older distros (Ubuntu 22.04) use Qt5, newer use Qt6
+          if [ "$MATRIX_DISTRO" = "jammy" ]; then
             QT_PROFILE="pythonscad-qt5"
           else
             QT_PROFILE="pythonscad-qt6"
@@ -179,8 +179,8 @@ jobs:
           apt-get install -y git python3
 
           # Determine Qt profile based on distribution version
-          # Older distros (Ubuntu 22.04, Debian 11) use Qt5, newer use Qt6
-          if [ "$MATRIX_DISTRO" = "jammy" ] || [ "$MATRIX_DISTRO" = "bullseye" ]; then
+          # Older distros (Ubuntu 22.04) use Qt5, newer use Qt6
+          if [ "$MATRIX_DISTRO" = "jammy" ]; then
             QT_PROFILE="pythonscad-qt5"
           else
             QT_PROFILE="pythonscad-qt6"
@@ -216,7 +216,7 @@ jobs:
           OUTPUT_DIR: /tmp/debs
           DEBIAN_DISTRO: ${{ matrix.distro }}
           # Set Qt version for older distros
-          USE_QT6: ${{ (matrix.distro == 'jammy' || matrix.distro == 'bullseye') && 'OFF' || 'ON' }}
+          USE_QT6: ${{ matrix.distro == 'jammy' && 'OFF' || 'ON' }}
         run: |
           mkdir -p "$OUTPUT_DIR"
           chmod +x ./scripts/build-debian-package.sh
@@ -231,7 +231,7 @@ jobs:
           DEB_SIGNING_KEY: ${{ secrets.DEB_SIGNING_KEY }}
         run: |
           # Determine Qt profile based on distribution version
-          if [ "$MATRIX_DISTRO" = "jammy" ] || [ "$MATRIX_DISTRO" = "bullseye" ]; then
+          if [ "$MATRIX_DISTRO" = "jammy" ]; then
             QT_PROFILE="pythonscad-qt5"
             USE_QT6="OFF"
           else
@@ -370,7 +370,7 @@ jobs:
   publish-apt-repo:
     name: Publish APT repository to SFTP
     needs: build-debian
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     if: github.event_name == 'release' || github.event.inputs.upload_to_release != ''
 
     steps:
@@ -378,6 +378,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Install APT repository tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils
 
       - name: Download packages from GitHub Release
         run: |

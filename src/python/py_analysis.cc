@@ -33,6 +33,8 @@
 #include <PolySetUtils.h>
 #include <primitives.h>
 #include "pyfunctions.h"
+#include "glview/ColorMap.h"
+#include "glview/RenderSettings.h"
 
 PyObject *python_mesh_core(PyObject *obj, bool tessellate, bool color)
 {
@@ -42,6 +44,9 @@ PyObject *python_mesh_core(PyObject *obj, bool tessellate, bool color)
   if (child == NULL) return propagate_or_typeerror("Invalid type for  Object in mesh \n");
   Tree tree(child, "");
   GeometryEvaluator geomevaluator(tree);
+  const auto& scheme = ColorMap::instance().colorSchemeOrDefault(RenderSettings::inst()->colorscheme);
+  const auto material = ColorMap::getColor(scheme, RenderColor::CGAL_FACE_FRONT_COLOR);
+  const auto cutout = ColorMap::getColor(scheme, RenderColor::CGAL_FACE_BACK_COLOR);
   std::shared_ptr<const Geometry> geom = geomevaluator.evaluateGeometry(*tree.root(), true);
   std::shared_ptr<const PolySet> ps = PolySetUtils::getGeometryAsPolySet(geom);
 
@@ -70,11 +75,12 @@ PyObject *python_mesh_core(PyObject *obj, bool tessellate, bool color)
       // Now create Python Color array
       PyObject *colorarr = PyList_New(ps->colors.size());
       for (unsigned int i = 0; i < ps->colors.size(); i++) {
+        const auto resolved = ps->colors[i].resolved(material, cutout);
         PyObject *color = PyList_New(4);
-        PyList_SetItem(color, 0, PyFloat_FromDouble(ps->colors[i].r()));
-        PyList_SetItem(color, 1, PyFloat_FromDouble(ps->colors[i].g()));
-        PyList_SetItem(color, 2, PyFloat_FromDouble(ps->colors[i].b()));
-        PyList_SetItem(color, 3, PyFloat_FromDouble(ps->colors[i].a()));
+        PyList_SetItem(color, 0, PyFloat_FromDouble(resolved.r()));
+        PyList_SetItem(color, 1, PyFloat_FromDouble(resolved.g()));
+        PyList_SetItem(color, 2, PyFloat_FromDouble(resolved.b()));
+        PyList_SetItem(color, 3, PyFloat_FromDouble(resolved.a()));
         PyList_SetItem(colorarr, i, color);
       }
 
@@ -106,11 +112,12 @@ PyObject *python_mesh_core(PyObject *obj, bool tessellate, bool color)
       PyObject *pyth_outline = PyList_New(items);
       int ind = 0;
       if (color) {
+        const auto resolved = outline.color.resolved(material, cutout);
         PyObject *pyth_col = PyList_New(4);
-        PyList_SetItem(pyth_col, 0, PyFloat_FromDouble(outline.color.r()));
-        PyList_SetItem(pyth_col, 1, PyFloat_FromDouble(outline.color.g()));
-        PyList_SetItem(pyth_col, 2, PyFloat_FromDouble(outline.color.b()));
-        PyList_SetItem(pyth_col, 3, PyFloat_FromDouble(outline.color.a()));
+        PyList_SetItem(pyth_col, 0, PyFloat_FromDouble(resolved.r()));
+        PyList_SetItem(pyth_col, 1, PyFloat_FromDouble(resolved.g()));
+        PyList_SetItem(pyth_col, 2, PyFloat_FromDouble(resolved.b()));
+        PyList_SetItem(pyth_col, 3, PyFloat_FromDouble(resolved.a()));
         PyList_SetItem(pyth_outline, ind++, pyth_col);
       }
       for (unsigned int j = 0; j < outline.vertices.size(); j++) {
@@ -154,7 +161,7 @@ PyObject *python_oo_mesh(PyObject *obj, PyObject *args, PyObject *kwargs)
 PyObject *python_inside_core(PyObject *pyobj, PyObject *pypoint)
 {
   PyObject *dummydict = nullptr;
-  Vector3d vec3;
+  Vector3d vec3 = Vector3d::Zero();
   std::shared_ptr<AbstractNode> node = PyOpenSCADObjectToNode(pyobj, &dummydict);
   auto dummydict_owner = py_owned(dummydict);
   if (node == nullptr) {
@@ -171,7 +178,7 @@ PyObject *python_inside_core(PyObject *pyobj, PyObject *pypoint)
     auto geom = polygonnode->createGeometry();
     const Polygon2d poly2 = dynamic_cast<const Polygon2d&>(*geom);
     Vector2d vec2(vec3[0], vec3[1]);
-    if (poly2.point_inside(vec2)) Py_RETURN_TRUE;
+    if (poly2.point_location(vec2) >= PointLocation2d::OnVertex) Py_RETURN_TRUE;
     else Py_RETURN_FALSE;
   }
 
@@ -190,7 +197,7 @@ PyObject *python_inside_core(PyObject *pyobj, PyObject *pypoint)
   std::shared_ptr<const PolySet> ps = PolySetUtils::getGeometryAsPolySet(geom);
   if (auto poly2 = std::dynamic_pointer_cast<const Polygon2d>(geom)) {
     Vector2d vec2(vec3[0], vec3[1]);
-    if (poly2->point_inside(vec2)) Py_RETURN_TRUE;
+    if (poly2->point_location(vec2) >= PointLocation2d::OnVertex) Py_RETURN_TRUE;
     else Py_RETURN_FALSE;
   }
   if (ps != nullptr) {
@@ -241,10 +248,11 @@ PyObject *python_bbox_core(PyObject *obj)
     Py_RETURN_NONE;
   }
 
-  // `size` may be a plain list or a NumPy array (when numpy is installed),
-  // so probe it through the sequence protocol rather than PyList_*.
+  // `size` may be a PyOpenSCADVector, plain list, or NumPy array.
   bool is_2d = false;
-  if (python_is_sequence(size)) {
+  if (PyObject_TypeCheck(size, &PyOpenSCADVectorType)) {
+    is_2d = ((PyOpenSCADVectorObject *)size)->dim == 2;
+  } else if (python_is_sequence(size)) {
     Py_ssize_t size_length = PySequence_Size(size);
     if (size_length < 0) {
       Py_DECREF(position);
@@ -317,16 +325,13 @@ PyObject *python_size_core(PyObject *obj)
   GeometryEvaluator geomevaluator(tree);
   std::shared_ptr<const Geometry> geom = geomevaluator.evaluateGeometry(*tree.root(), true);
 
-  // Handle 2D geometry (Polygon2d)
+  // Handle 2D geometry (Polygon2d) — same vector type as 3D, dim=2
   if (auto poly2d = std::dynamic_pointer_cast<const Polygon2d>(geom)) {
     BoundingBox bbox = poly2d->getBoundingBox();
     Vector3d bmin = bbox.min();
     Vector3d bmax = bbox.max();
-    PyObject *size_list = PyList_New(2);
-    PyList_SetItem(size_list, 0, PyFloat_FromDouble(bmax[0] - bmin[0]));
-    PyList_SetItem(size_list, 1, PyFloat_FromDouble(bmax[1] - bmin[1]));
-    Py_INCREF(size_list);
-    return size_list;
+    Vector3d size(bmax[0] - bmin[0], bmax[1] - bmin[1], 0);
+    return python_fromvector(size, 2);
   }
 
   std::shared_ptr<const PolySet> ps = PolySetUtils::getGeometryAsPolySet(geom);
@@ -339,11 +344,8 @@ PyObject *python_size_core(PyObject *obj)
         if (pt[i] < pmin[i]) pmin[i] = pt[i];
       }
     }
-    // Calculate size directly
     Vector3d size = pmax - pmin;
-    PyObject *size_list = python_fromvector(size);
-    Py_INCREF(size_list);
-    return size_list;
+    return python_fromvector(size);
   }
   Py_RETURN_NONE;
 }
@@ -361,15 +363,11 @@ PyObject *python_position_core(PyObject *obj)
   GeometryEvaluator geomevaluator(tree);
   std::shared_ptr<const Geometry> geom = geomevaluator.evaluateGeometry(*tree.root(), true);
 
-  // Handle 2D geometry (Polygon2d)
+  // Handle 2D geometry (Polygon2d) — same vector type as 3D, dim=2
   if (auto poly2d = std::dynamic_pointer_cast<const Polygon2d>(geom)) {
     BoundingBox bbox = poly2d->getBoundingBox();
     Vector3d bmin = bbox.min();
-    PyObject *position_list = PyList_New(2);
-    PyList_SetItem(position_list, 0, PyFloat_FromDouble(bmin[0]));
-    PyList_SetItem(position_list, 1, PyFloat_FromDouble(bmin[1]));
-    Py_INCREF(position_list);
-    return position_list;
+    return python_fromvector(Vector3d(bmin[0], bmin[1], 0), 2);
   }
 
   std::shared_ptr<const PolySet> ps = PolySetUtils::getGeometryAsPolySet(geom);
@@ -380,9 +378,7 @@ PyObject *python_position_core(PyObject *obj)
         if (pt[i] < pmin[i]) pmin[i] = pt[i];
       }
     }
-    PyObject *position_list = python_fromvector(pmin);
-    Py_INCREF(position_list);
-    return position_list;
+    return python_fromvector(pmin);
   }
   Py_RETURN_NONE;
 }
